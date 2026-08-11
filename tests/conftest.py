@@ -17,6 +17,6 @@ def settings() -> Settings:
 
 @pytest.fixture
 def client(settings: Settings) -> Iterator[TestClient]:
-    """An HTTP client bound to an isolated application instance."""
+    """An HTTP client bound to an isolated application with its own empty index."""
     with TestClient(create_app(settings)) as test_client:
         yield test_client
