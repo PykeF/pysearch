@@ -1,0 +1,34 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+.venv/
+venv/
+
+# Packaging / build artefacts
+build/
+dist/
+*.egg-info/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local configuration and secrets (.env.example is committed, .env is not)
+.env
+.env.*
+!.env.example
+
+# Editors and local tooling state
+.idea/
+.vscode/
+*.swp
+.claude/settings.local.json
+
+# macOS
+.DS_Store
