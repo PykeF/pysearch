@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from app.api.documents import IndexDocumentRequest
 from app.api.search import DEFAULT_LIMIT, MAX_LIMIT, SearchHit, SearchResponse
+from app.api.semantic import SemanticSearchResponse
 from app.cluster.coordinator import Coordinator
 from app.search.document import Document
 
@@ -147,6 +148,41 @@ async def search(
     )
 
 
+@router.get(
+    "/search/semantic",
+    summary="Search the cluster by meaning rather than by words",
+    responses={
+        status.HTTP_503_SERVICE_UNAVAILABLE: {
+            "description": "Semantic search is disabled, or a logical shard has no usable copy."
+        }
+    },
+)
+async def semantic_search(
+    coordinator: CoordinatorDep,
+    q: Annotated[str, Query(description="The query text.")],
+    limit: Annotated[
+        int, Query(ge=1, le=MAX_LIMIT, description="Maximum results to return.")
+    ] = DEFAULT_LIMIT,
+) -> SemanticSearchResponse:
+    """Rank documents across every shard by embedding similarity.
+
+    One fan-out round rather than two: a cosine similarity depends only on the
+    query and document vectors, so — unlike BM25 — no corpus-wide statistics
+    have to be gathered before the shards can produce comparable scores.
+
+    Scores lie in [-1, 1] and are **not** comparable with BM25 scores.
+    """
+    outcome = await coordinator.semantic_search(q, limit)
+    return SemanticSearchResponse(
+        query=q,
+        total=outcome.total,
+        results=[
+            SearchHit(document_id=hit.document_id, score=hit.score, text=hit.text)
+            for hit in outcome.results
+        ],
+    )
+
+
 @router.get("/index/stats", summary="Report cluster index statistics")
 async def index_stats(coordinator: CoordinatorDep) -> ClusterStatsResponse:
     """Aggregate index statistics across the cluster."""
@@ -208,6 +244,13 @@ class ShardStatusResponse(BaseModel):
     copies: list[CopyStatusResponse]
 
 
+class SemanticStatusResponse(BaseModel):
+    """Whether the cluster can answer semantic queries, and in which space."""
+
+    enabled: bool
+    identity: str | None = None
+
+
 class ClusterStatusResponse(BaseModel):
     """Cluster capability, shard by shard.
 
@@ -220,6 +263,7 @@ class ClusterStatusResponse(BaseModel):
     replication_factor: int
     search_available: bool
     write_available: bool
+    semantic: SemanticStatusResponse
     shards: list[ShardStatusResponse]
 
 
@@ -232,6 +276,12 @@ async def cluster_status(coordinator: CoordinatorDep) -> ClusterStatusResponse:
         replication_factor=health.replication_factor,
         search_available=health.search_available,
         write_available=health.write_available,
+        semantic=SemanticStatusResponse(
+            enabled=coordinator.semantic_enabled,
+            identity=(
+                coordinator.semantic_identity.fingerprint if coordinator.semantic_identity else None
+            ),
+        ),
         shards=[
             ShardStatusResponse(
                 shard_id=shard.shard_id,

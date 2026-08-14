@@ -8,8 +8,10 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import httpx2
+import numpy as np
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -19,8 +21,10 @@ from app.cluster.replication import HttpNodeLink
 from app.cluster.topology import build_topology
 from app.core.config import Settings
 from app.main import create_app
+from app.search.analysis import analyze
 from app.search.document import Document
 from app.search.engine import SearchEngine
+from app.semantic.embedder import L2_NORMALIZATION, SemanticIdentity, normalize_rows
 from app.storage.base import DocumentStore
 from app.storage.sqlite_store import SqliteDocumentStore
 
@@ -66,6 +70,65 @@ class InMemoryDocumentStore:
 
     def close(self) -> None:
         return None
+
+
+class FakeEmbedder:
+    """A deterministic embedder that needs no model and no network.
+
+    Text is projected onto a handful of fixed "topic" words: each dimension
+    counts how often that topic's words appear, and the result is normalized.
+    That is not real semantics, but it is *stable* semantics — documents about
+    the same topic land near each other and unrelated ones do not — which is
+    exactly what the vector plumbing needs in order to be tested without loading
+    a transformer into three hundred tests.
+    """
+
+    TOPICS: tuple[tuple[str, ...], ...] = (
+        ("car", "cars", "automobile", "engine", "vehicle", "motor", "repair", "maintenance"),
+        ("search", "query", "ranking", "retrieval", "index", "relevance", "bm25"),
+        ("cook", "cooking", "pasta", "recipe", "food", "kitchen", "boiling", "water"),
+        ("shard", "replica", "cluster", "node", "distributed", "replication", "failover"),
+    )
+
+    def __init__(self, model_id: str = "fake-topics", revision: str = "v1") -> None:
+        self._identity = SemanticIdentity(
+            implementation="fake",
+            model_id=model_id,
+            model_revision=revision,
+            dimension=len(self.TOPICS) + 1,
+            normalization=L2_NORMALIZATION,
+        )
+
+    @property
+    def identity(self) -> SemanticIdentity:
+        return self._identity
+
+    def embed_documents(self, texts: Sequence[str]) -> Any:
+        if not texts:
+            return np.zeros((0, self._identity.dimension), dtype=np.float32)
+        rows = np.stack([self._project(text) for text in texts])
+        return normalize_rows(rows)
+
+    def embed_query(self, text: str) -> Any:
+        return self.embed_documents([text])[0]
+
+    def _project(self, text: str) -> Any:
+        counts = np.zeros(self._identity.dimension, dtype=np.float32)
+        tokens = analyze(text)
+        for token in tokens:
+            for position, topic in enumerate(self.TOPICS):
+                if token in topic:
+                    counts[position] += 1.0
+        # A constant last dimension keeps a text with no topic word from
+        # embedding to the zero vector, which has no direction at all.
+        counts[-1] = 0.25
+        return counts
+
+
+@pytest.fixture
+def embedder() -> FakeEmbedder:
+    """A deterministic embedder for every test that needs the semantic path."""
+    return FakeEmbedder()
 
 
 @pytest.fixture
@@ -124,6 +187,17 @@ def document_store(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[D
 def engine() -> Iterator[SearchEngine]:
     """An initialized engine over an in-memory store, for behaviour tests."""
     search_engine = SearchEngine(InMemoryDocumentStore())
+    search_engine.initialize()
+    try:
+        yield search_engine
+    finally:
+        search_engine.close()
+
+
+@pytest.fixture
+def semantic_engine(embedder: FakeEmbedder) -> Iterator[SearchEngine]:
+    """An initialized engine with semantic retrieval enabled."""
+    search_engine = SearchEngine(InMemoryDocumentStore(), embedder=embedder)
     search_engine.initialize()
     try:
         yield search_engine
@@ -194,7 +268,12 @@ def asgi_client(app: FastAPI, base_url: str) -> httpx2.AsyncClient:
     return httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url=base_url)
 
 
-def launch_cluster(stack: ExitStack, directory: Path, replication_factor: int = 1) -> Cluster:
+def launch_cluster(
+    stack: ExitStack,
+    directory: Path,
+    replication_factor: int = 1,
+    embedder: object | None = None,
+) -> Cluster:
     """Bring up shard nodes and a coordinator wired to them.
 
     Each physical node is a real application with its own engine and its own
@@ -226,7 +305,7 @@ def launch_cluster(stack: ExitStack, directory: Path, replication_factor: int = 
             replicas=[replica_url] if replicated else [],
         )
         shard_paths.append(primary_settings.storage_path)
-        primary_app = create_app(primary_settings, node_links=link_to)
+        primary_app = create_app(primary_settings, node_links=link_to, embedder=embedder)
         apps_by_url[primary_url] = primary_app
         nodes[f"shard-{shard_id}-primary"] = primary_app
 
@@ -236,7 +315,7 @@ def launch_cluster(stack: ExitStack, directory: Path, replication_factor: int = 
                 shard_id, directory, replica_role="replica", primary_url=primary_url
             )
             shard_paths.append(replica_settings.storage_path)
-            replica_app = create_app(replica_settings, node_links=link_to)
+            replica_app = create_app(replica_settings, node_links=link_to, embedder=embedder)
             apps_by_url[replica_url] = replica_app
             nodes[f"shard-{shard_id}-replica"] = replica_app
 
@@ -253,7 +332,11 @@ def launch_cluster(stack: ExitStack, directory: Path, replication_factor: int = 
 
     topology = build_topology(primaries=primaries, replicas=replicas)
     coordinator = TestClient(
-        create_app(make_coordinator_settings(replication_factor), topology=topology)
+        create_app(
+            make_coordinator_settings(replication_factor),
+            topology=topology,
+            embedder=embedder,
+        )
     )
     stack.enter_context(coordinator)
     return Cluster(client=coordinator, shard_paths=tuple(shard_paths), nodes=nodes)
@@ -264,6 +347,20 @@ def cluster(tmp_path: Path) -> Iterator[Cluster]:
     """A three-shard cluster with one copy per shard and an empty corpus."""
     with ExitStack() as stack:
         yield launch_cluster(stack, tmp_path)
+
+
+@pytest.fixture
+def semantic_cluster(tmp_path: Path, embedder: FakeEmbedder) -> Iterator[Cluster]:
+    """A three-shard cluster with semantic retrieval enabled on every node."""
+    with ExitStack() as stack:
+        yield launch_cluster(stack, tmp_path, embedder=embedder)
+
+
+@pytest.fixture
+def replicated_semantic_cluster(tmp_path: Path, embedder: FakeEmbedder) -> Iterator[Cluster]:
+    """A replicated cluster with semantic retrieval enabled on every copy."""
+    with ExitStack() as stack:
+        yield launch_cluster(stack, tmp_path, replication_factor=2, embedder=embedder)
 
 
 @pytest.fixture

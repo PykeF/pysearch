@@ -11,6 +11,7 @@ There is no second search implementation for distributed mode.
 
 from typing import Annotated
 
+import numpy as np
 from fastapi import APIRouter, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
 
@@ -18,6 +19,7 @@ from app.api.dependencies import EngineDep, PrimaryDep, ReplicaDep, SettingsDep
 from app.search.document import Document
 from app.search.engine import ReplicationOutcome
 from app.search.index import CorpusStats
+from app.semantic.embedder import SemanticIdentity
 
 router = APIRouter(prefix="/internal", tags=["internal"])
 
@@ -184,6 +186,9 @@ class NodeStatusResponse(BaseModel):
     state: str
     ready: bool
     generation: int
+    semantic_enabled: bool = False
+    semantic_identity: str | None = None
+    vector_count: int | None = None
 
 
 class ExportedDocument(BaseModel):
@@ -280,6 +285,11 @@ def node_status(engine: EngineDep, settings: SettingsDep) -> NodeStatusResponse:
         state=str(engine_status.state),
         ready=engine_status.ready,
         generation=engine_status.generation,
+        semantic_enabled=engine.semantic_enabled,
+        semantic_identity=(
+            engine.semantic_identity.fingerprint if engine.semantic_identity else None
+        ),
+        vector_count=engine.vector_count,
     )
 
 
@@ -290,3 +300,71 @@ def resynchronize(synchronizer: ReplicaDep) -> NodeStatusResponse | ReplicationR
     if not outcome.synchronized:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=outcome.detail)
     return ReplicationResponse(outcome="resynchronized", generation=outcome.local_generation)
+
+
+class SemanticIdentityModel(BaseModel):
+    """The embedding space a semantic request belongs to."""
+
+    implementation: str
+    model_id: str
+    model_revision: str
+    dimension: int
+    normalization: str
+
+    def to_identity(self) -> SemanticIdentity:
+        return SemanticIdentity(
+            implementation=self.implementation,
+            model_id=self.model_id,
+            model_revision=self.model_revision,
+            dimension=self.dimension,
+            normalization=self.normalization,
+        )
+
+
+class InternalSemanticSearchRequest(BaseModel):
+    """A query vector to rank this shard's documents against."""
+
+    vector: list[float]
+    limit: int = Field(ge=1, le=MAX_LIMIT)
+    identity: SemanticIdentityModel
+
+
+@router.post(
+    "/search/semantic",
+    summary="Search this shard against a query vector",
+    responses={status.HTTP_409_CONFLICT: {"description": "A different embedding model is in use."}},
+)
+def semantic_search(
+    payload: InternalSemanticSearchRequest, engine: EngineDep
+) -> InternalSearchResponse:
+    """Rank this shard's documents against a vector the coordinator embedded.
+
+    The identity is checked first. Vectors from different models measure
+    different spaces, so a mismatch is refused rather than answered with numbers
+    that would look like similarities and mean nothing.
+    """
+    local = engine.semantic_identity
+    if local is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="semantic search is not enabled on this node",
+        )
+
+    incoming = payload.identity.to_identity()
+    if not local.is_compatible_with(incoming):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"semantic identity mismatch: this node uses {local.fingerprint}, "
+                f"the request carries {incoming.fingerprint}"
+            ),
+        )
+
+    outcome = engine.semantic_search(np.asarray(payload.vector, dtype=np.float32), payload.limit)
+    return InternalSearchResponse(
+        total=outcome.total,
+        results=[
+            InternalHit(document_id=hit.document_id, score=hit.score, text=hit.text)
+            for hit in outcome.results
+        ],
+    )

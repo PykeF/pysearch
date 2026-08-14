@@ -2,7 +2,7 @@
 
 An educational distributed search engine, written from scratch in Python.
 
-> **Current status: Phase 4 — replication and availability.**
+> **Current status: Phase 5 — semantic and vector search.**
 > PySearch is a working replicated distributed lexical search engine. Documents
 > are partitioned across logical shards by a stable hash; each logical shard has
 > a primary and a replica, each with its own durable SQLite corpus and in-memory
@@ -10,10 +10,16 @@ An educational distributed search engine, written from scratch in Python.
 > replica when a primary is lost. Distributed ranking is equivalent to a single
 > node holding the whole corpus, before and after failover.
 >
+> It now has a **second, independent retrieval path**: documents are embedded
+> and searched by vector similarity through `/search/semantic`, while `/search`
+> remains exactly the BM25 it always was. The two are never combined — that is
+> the next phase's question.
+>
 > **Reads fail over automatically; writes do not.** There is no leader election
 > and no automatic promotion, so losing a primary means that logical shard stops
-> accepting writes until it returns. There is no semantic search. Those are the
-> roadmap below, not features of this code.
+> accepting writes until it returns. Vector search is **exact, not approximate**,
+> and there is no hybrid ranking. Those are the roadmap below, not features of
+> this code.
 
 ## Motivation
 
@@ -30,7 +36,7 @@ effort stays on the parts worth understanding.
 
 ## What exists today
 
-**Implemented (Phases 0–4)**
+**Implemented (Phases 0–5)**
 
 - Unicode-aware text normalization and tokenization, shared by documents and queries
 - An in-memory inverted index with posting lists and term frequencies
@@ -46,17 +52,21 @@ effort stays on the parts worth understanding.
 - **Synchronous write-all replication with a contiguous mutation sequence**
 - **Automatic read failover to a verified-synchronized replica**
 - **Replica resynchronization, with unverified copies refusing to serve**
-- **Cluster status separating search availability from write availability**
+- Cluster status separating search availability from write availability
+- **Document and query embeddings behind a swappable model boundary**
+- **An exact vector index with cosine similarity, written here**
+- **Distributed semantic search in a single fan-out round, with failover**
+- **A labelled BM25-versus-semantic evaluation, reported separately**
 - **Docker Compose topology for reproducible multi-node local deployment**
 - HTTP APIs for indexing, deletion, search and index statistics
 - Structured JSON logging carrying node role and shard id
-- 333 tests, strict type checking, linting and formatting gates
+- 415 tests, strict type checking, linting and formatting gates
 
-**Not implemented** — leader election, consensus, automatic primary promotion,
-writable failover, multi-primary writes, dynamic membership, rebalancing,
-coordinator replication, index snapshots, query caching, phrase or fuzzy
-search, stemming, embeddings, vector search, hybrid retrieval, authentication.
-See the roadmap.
+**Not implemented** — hybrid retrieval, rank fusion, reranking, approximate
+nearest-neighbour search, persisted vectors, leader election, consensus,
+automatic primary promotion, writable failover, dynamic membership,
+rebalancing, coordinator replication, index snapshots, query caching, phrase or
+fuzzy search, stemming, authentication. See the roadmap.
 
 ## Architecture
 
@@ -355,6 +365,207 @@ Rebuild is roughly linear and runs an order of magnitude faster than the origina
 indexing, because indexing pays one fsync per document while recovery is a single
 sequential read. Snapshots would only become worth their consistency cost once
 this column stops being acceptable.
+
+## Semantic search
+
+### Two independent paths
+
+```text
+                        Document (SQLite = authoritative)
+                          /                        \
+                    analyze()                   embed()
+                        |                          |
+                 InvertedIndex               ExactVectorIndex
+                        |                          |
+                      BM25                 cosine similarity
+                        |                          |
+                  GET /search             GET /search/semantic
+```
+
+Both are derived from the same authoritative documents, and **neither depends on
+the other**. `/search` is the BM25 it has always been; `/search/semantic` is a
+separate endpoint with its own score scale. They are deliberately not combined:
+how to fuse two rankings is a real question with real trade-offs, and answering
+it by quietly averaging two incomparable numbers would be the wrong answer.
+
+Semantic search is **off by default**. Enabling it is `PYSEARCH_SEMANTIC_ENABLED`,
+which keeps lexical-only deployments — and the whole existing test suite — free
+of a model and its startup cost.
+
+### The model
+
+| | |
+| --- | --- |
+| Implementation | `model2vec` |
+| Model | `minishlab/potion-base-8M` |
+| Revision | `bf8b0566…` — pinned, not a branch |
+| Dimension | 256 |
+| Normalization | L2, applied in one place |
+| Similarity | cosine, computed as a dot product |
+
+A **static** embedding model: every token has a fixed vector and a document
+embedding is the mean of its token vectors, so there is no neural network at
+inference time. That buys a ~10 MB dependency instead of the ~1 GB a torch-based
+stack costs, CPU speed, and behaviour deterministic enough to test. It is
+measurably weaker than a real transformer, and the `Embedder` protocol exists so
+that swapping one in is a small change if the evaluation ever says the gigabyte
+is worth it.
+
+The model is downloaded once on first use. **`uv run pytest` never downloads
+anything**: the suite runs against a deterministic fake embedder, and the tests
+that use the real model are behind a marker.
+
+### Semantic identity
+
+Vectors from different models measure different spaces, so comparing them
+produces numbers that look like similarities and mean nothing. Five fields must
+match exactly before two copies are treated as interchangeable:
+
+```text
+implementation : model_id @ revision / dimension / normalization
+```
+
+The revision is part of it because a repository can move while keeping its name.
+The coordinator sends this identity with every query vector and a shard **refuses
+with 409** if it disagrees — checked per request, at no extra round trip.
+
+What is deliberately **not** claimed is bit-for-bit identical vectors. Library
+versions and floating-point reduction order can move the last bits. The
+guarantee is that copies sharing an identity produce equivalent embeddings, and
+therefore **identical ordering and identical tie-breaking**, with scores equal to
+within a strict tolerance — which is exactly what the tests assert.
+
+### Exact search, not approximate
+
+The vector index compares the query against every stored vector: one `(N, d)`
+matrix multiply, O(N·d), plus O(N log N) to order the results. That is a
+deliberate starting point, not a shortcut.
+
+- Approximate search can only be *evaluated* against exact search, so exact has
+  to exist first regardless.
+- Delete and replace have to be exact, because replication treats a copy's
+  derived state as an exact function of its documents. Approximate indexes reach
+  that through tombstones and periodic rebuilds, which would put approximation
+  underneath a correctness invariant.
+- FAISS `IndexFlatIP` would make the same multiply faster without changing its
+  complexity, in exchange for a native dependency.
+
+**FAISS and ANN were evaluated and declined.** The measurements that would
+overturn that are in the table below, and `scripts/semantic_benchmark.py`
+reproduces them.
+
+### Vectors are derived, and not persisted
+
+Documents remain the only authoritative corpus. Vectors are rebuilt by
+re-embedding at startup, so there is no second durable derived state and no
+model-version invalidation problem: if the configured model changes, every
+vector is simply rebuilt from the documents.
+
+Embedding is a **precondition of every mutation**, on both the local and the
+replicated write path:
+
+```text
+analyze + embed  ->  durable commit (generation N+1)  ->  cache, index, vectors
+```
+
+Computing the vector *before* the durable write is what makes an embedding
+failure harmless: nothing is committed, no generation is consumed, and the node
+stays healthy. A replica follows the same rule, so it can never look
+synchronized while its semantic state is missing — and it checks the incoming
+generation first, so a redelivery or a gap costs no model inference.
+
+Replacement replaces the vector, deletion removes it, and both are asserted
+directly rather than inferred from ranking.
+
+### Replication
+
+Replication ships **documents only**; every copy derives its own vectors. That
+keeps one rule instead of two, because resynchronization already transfers
+documents and rebuilds derived state — so the replication path and the recovery
+path do the same thing. The cost is duplicate inference, cheap with this model
+and worth revisiting with an expensive one.
+
+### Distributed semantic search — one round, not two
+
+```text
+query -> coordinator embeds once -> one fan-out -> local top-k -> merge
+```
+
+This is the architectural contrast worth stating. BM25 needs a **statistics
+round** because `idf` depends on corpus-wide `N` and `df`, so scores from
+different shards are not comparable until they share those numbers. A cosine
+similarity depends on **nothing but the two vectors** — so comparability is a
+property of the metric rather than something the coordinator has to arrange.
+There is no statistics round, and with no second round there is no pinning
+problem either.
+
+The coordinator embeds the query **once** so every shard scores against an
+identical vector. Exactly one serving copy per logical shard answers, so
+replicas are never double-counted. Local top-k is sufficient for global top-k by
+the same argument as the lexical path, and the merge uses the same rule: score
+descending, then document id ascending.
+
+Failover, readiness and the fail-whole policy are unchanged: a READY replica can
+serve, an out-of-sync one cannot, and losing every copy of a logical shard
+returns **503** rather than a partial answer.
+
+### Lexical versus semantic, measured
+
+`scripts/evaluate_retrieval.py` runs 13 labelled queries against a 23-document
+synthetic corpus and reports the two modes separately. **A local development
+measurement, not a benchmark** — the corpus is far too small to say anything
+general.
+
+| | BM25 | semantic |
+| --- | --- | --- |
+| Recall@5 | 0.58 | 1.00 |
+| MRR | 0.57 | 1.00 |
+
+The averages are less interesting than where they come from. BM25 scored **0.00
+on four of the six paraphrase queries** — it returned no documents at all for
+"car maintenance", because the word "car" appears nowhere in the corpus — and
+1.00 on every query that shares vocabulary with its answer.
+
+The honest caveat: this set contains **no query where BM25 beats semantic**,
+including the identifier cases where I expected it to, since subword
+tokenization captures exact tokens better than I predicted. That is a limitation
+of the evaluation, not evidence that lexical retrieval is redundant.
+
+What the measurement does show is that the two answer *different questions*.
+BM25 has a notion of not matching: it returns 0 candidates for a paraphrase and
+1 for an identifier. A similarity is defined for every document, so semantic
+search always ranks the entire corpus and never says "no". Live, through the
+coordinator:
+
+```text
+query: "car maintenance"
+  GET /search           ->  total=0   (nothing contains "car")
+  GET /search/semantic  ->  doc-1 0.6011  "automobile repair and servicing..."
+```
+
+That difference — one mode that can say nothing matched, one that always ranks
+everything — is the actual motivation for the next phase.
+
+### What it costs
+
+Local development measurements on one machine with synthetic 40-word documents,
+from `scripts/semantic_benchmark.py`. **Not a benchmark.**
+
+| Documents | Lexical rebuild | Semantic rebuild | Vector search | Vector memory |
+| --- | --- | --- | --- | --- |
+| 100 | 0.002 s | 0.003 s | 0.032 ms | 0.1 MB |
+| 1,000 | 0.026 s | 0.034 s | 0.257 ms | 1.0 MB |
+| 5,000 | 0.151 s | 0.171 s | 1.980 ms | 5.1 MB |
+
+Model load 0.197 s; embedding ~20,800 documents/s batched; query embedding
+0.050 ms. Vector memory is `N × d × 4` bytes for float32, excluding Python
+overhead.
+
+Two decisions were made pending these numbers. **Re-embedding at startup costs
+about the same as the lexical rebuild**, which is why vectors are not persisted.
+**Search grows linearly** — 2 ms at 5,000 documents implies tens of milliseconds
+at a hundred thousand — and that column is what would eventually justify an
+approximate index.
 
 ## Replication and availability
 
@@ -713,6 +924,20 @@ These are exactly the quantities BM25 scores with, which is why they are worth
 exposing: they make ranking behaviour and the effect of updates and deletions
 observable. Posting lists and other internal structures are not exposed.
 
+### Semantic search
+
+```bash
+curl 'localhost:8000/search/semantic?q=car%20maintenance&limit=5'
+```
+
+Same response shape as `/search`, with one difference worth reading: `total` is
+the number of documents **searched**, not matched. A similarity is defined for
+every document, so there is no such thing as not matching — the ranking is the
+answer. Scores lie in `[-1, 1]` and are **not comparable with BM25 scores**.
+
+Returns `503` when semantic search is disabled, or when a logical shard has no
+copy that can serve it.
+
 ### Health and readiness
 
 `GET /health` returns `{"status": "ok"}` whenever the process is alive. It
@@ -746,7 +971,11 @@ Let `T` be the tokens in a document, `U` its unique terms, `V` the vocabulary,
 | Global merge | O(S·k log(S·k)) | `S` shards each returning `k` candidates |
 | Replicated write | primary commit + one call per replica | write latency now includes replication |
 | Replicated search | unchanged | one serving copy per logical shard, never every replica |
-| Resynchronization | O(documents in the logical shard) | full snapshot transfer and index rebuild |
+| Resynchronization | O(documents in the logical shard) | full snapshot transfer, then lexical **and** vector rebuild |
+| Embedding a document | O(tokens) | a table lookup per token and a mean; no network at inference |
+| Semantic search | O(N·d + N log N) | one matrix multiply, then an ordering |
+| Semantic fan-out | 1 parallel round | no statistics round: similarity needs no corpus-wide numbers |
+| Vector memory | N·d·4 bytes | float32, 256 dimensions, excluding Python overhead |
 
 The query cost is the whole point of an inverted index: it is proportional to
 how many documents contain the query terms, not to `N`. A term absent from the
@@ -874,6 +1103,35 @@ this was developed on, so the image has never been built here. The distributed
 system itself does not depend on Docker and was verified with real multi-process
 clusters; Compose is a packaging convenience, not the architecture.
 
+### Try semantic search
+
+Semantic retrieval needs the optional extra and is off by default:
+
+```bash
+uv sync --extra semantic
+```
+
+```bash
+PYSEARCH_SEMANTIC_ENABLED=true uv run --extra semantic uvicorn app.main:app
+```
+
+The pinned model (~30 MB) downloads once on first start. Then compare the two
+retrieval modes on the same query:
+
+```bash
+curl 'localhost:8000/search/semantic?q=car+maintenance'
+```
+
+### Measure retrieval quality and cost
+
+```bash
+uv run --extra semantic python scripts/evaluate_retrieval.py
+```
+
+```bash
+uv run --extra semantic python scripts/semantic_benchmark.py
+```
+
 ### Run the quality gates
 
 ```bash
@@ -890,6 +1148,13 @@ uv run ruff format --check .
 
 ```bash
 uv run mypy app
+```
+
+`uv run pytest` never downloads a model: the suite runs against a deterministic
+fake embedder. The tests that load the real one are behind a marker:
+
+```bash
+uv run --extra semantic pytest -m semantic_model
 ```
 
 ## Configuration
@@ -915,6 +1180,13 @@ override them locally; `.env` is git-ignored.
 | `PYSEARCH_CONNECT_TIMEOUT` | `1.0` | seconds |
 | `PYSEARCH_REQUEST_TIMEOUT` | `2.0` | seconds, coordinator to node |
 | `PYSEARCH_REPLICATION_TIMEOUT` | `2.0` | seconds, primary to replica |
+| `PYSEARCH_SEMANTIC_ENABLED` | `false` | load an embedding model and maintain vectors |
+| `PYSEARCH_EMBEDDING_MODEL` | `minishlab/potion-base-8M` | embedding model |
+| `PYSEARCH_EMBEDDING_MODEL_REVISION` | `bf8b0566…` | pinned revision, not a branch |
+
+There is deliberately **no vector-dimension setting**: it is a property of the
+model, discovered when it loads. Configuring it would only create a way for it
+to be wrong.
 
 Inconsistent topologies fail at startup rather than in flight: a shard without
 an id, a shard id outside the shard count, a coordinator without URLs, a URL
@@ -980,7 +1252,7 @@ API, parallel fan-out, cluster-wide BM25 statistics, deterministic global top-k
 merging, a fail-whole partial-failure policy, and a Docker Compose topology for
 reproducible multi-node local deployment.
 
-### Phase 4 — Replication and availability ✅ *current*
+### Phase 4 — Replication and availability ✅
 
 Logical shards separated from physical nodes, synchronous write-all replication
 with contiguous generations, automatic read failover, replica resynchronization,
@@ -988,12 +1260,13 @@ split-brain prevention by static roles, and a capability-aware cluster status.
 Leader election and automatic promotion were evaluated and deliberately not
 built; the reasoning is above.
 
-### Phase 5 — Semantic and vector search
+### Phase 5 — Semantic and vector search ✅ *current*
 
-Document and query embeddings, vector indexing, similarity search, approximate
-nearest-neighbour retrieval, a semantic search API, and recall/latency
-evaluation. The ANN approach will be selected on merit; FAISS is a candidate,
-not a foregone conclusion.
+Embeddings behind a swappable boundary, an exact vector index, a semantic search
+API, distributed semantic retrieval with failover, and a labelled evaluation
+against BM25. Approximate nearest-neighbour search and FAISS were both evaluated
+and deliberately declined; the reasoning and the measurements that would
+overturn it are above.
 
 ### Phase 6 — Hybrid search
 
@@ -1028,6 +1301,10 @@ app/
 │   ├── base.py       the DocumentStore protocol
 │   ├── errors.py     StorageError, StorageInitializationError
 │   └── sqlite_store.py
+├── semantic/        embeddings and vectors — no FastAPI in here either
+│   ├── embedder.py   the Embedder protocol, semantic identity, the model
+│   ├── vector_index.py exact cosine search over a NumPy matrix
+│   └── errors.py     SemanticDisabledError, EmbeddingError, ...
 └── cluster/          distributed logic — no FastAPI in here either
     ├── routing.py    stable hash routing onto logical shards
     ├── topology.py   logical shards and the physical copies holding them
@@ -1038,14 +1315,16 @@ app/
 scripts/
 ├── demo.py              runnable walkthrough, including a restart
 ├── rebuild_benchmark.py startup recovery cost by corpus size
+├── evaluate_retrieval.py BM25 versus semantic on a labelled set
+├── semantic_benchmark.py embedding, rebuild and vector-search costs
 └── run_cluster.py       a real multi-process cluster, without containers
 Dockerfile, docker-compose.yml   reproducible multi-node deployment
 tests/unit/           analysis, index, ranking, engine, storage, persistence
 tests/integration/    the HTTP API, and restart recovery
 ```
 
-Modules for cluster membership and rebalancing will be created when the phase
-that needs them begins — not in advance.
+Modules for hybrid retrieval and rank fusion will be created when the phase that
+needs them begins — not in advance.
 
 ## Known limitations
 
@@ -1065,6 +1344,15 @@ Stated plainly, because each is a real consequence of a deliberate choice:
   one response; there is no incremental catch-up log.
 - **Internal endpoints are unauthenticated** and assume a trusted network.
 - **The shard count and replication factor are fixed** for a cluster's life.
+- **Vector search is exact**, so query cost grows linearly with the corpus.
+- **Vectors are not persisted**, so every start re-embeds the whole corpus.
+- **Embedding quality is that of a static model** — meaningfully below a real
+  transformer, and the evaluation above is far too small to generalise from.
+- **Every replica embeds independently**, doubling inference for each copy.
+- **Semantic scores are not comparable with BM25 scores**, and nothing here
+  combines them.
+- **The first start with semantic enabled downloads the model**, so that node
+  needs network access once.
 
 ## Independence and attribution
 

@@ -25,6 +25,7 @@ from app.api.health import router as health_router
 from app.api.index import router as index_router
 from app.api.internal import router as internal_router
 from app.api.search import router as search_router
+from app.api.semantic import router as semantic_router
 from app.cluster.client import HttpShardClient
 from app.cluster.coordinator import Coordinator
 from app.cluster.errors import ClusterError
@@ -40,6 +41,8 @@ from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
 from app.search.engine import SearchEngine
 from app.search.errors import DocumentNotFoundError, EngineNotReadyError, InvalidDocumentError
+from app.semantic.embedder import Embedder, Model2VecEmbedder
+from app.semantic.errors import SemanticError
 from app.storage.errors import StorageError
 from app.storage.sqlite_store import SqliteDocumentStore
 
@@ -93,6 +96,15 @@ def _handle_cluster_error(request: Request, exc: Exception) -> JSONResponse:
     )
 
 
+def _handle_semantic_error(request: Request, exc: Exception) -> JSONResponse:
+    """Translate a semantic failure into 503, without leaking model internals."""
+    logger.error("semantic operation failed", exc_info=exc)
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": str(exc)},
+    )
+
+
 def _register_error_handlers(app: FastAPI) -> None:
     """Map transport-agnostic errors onto status codes in one place."""
     app.add_exception_handler(DocumentNotFoundError, _handle_document_not_found)
@@ -100,10 +112,26 @@ def _register_error_handlers(app: FastAPI) -> None:
     app.add_exception_handler(EngineNotReadyError, _handle_engine_not_ready)
     app.add_exception_handler(StorageError, _handle_storage_error)
     app.add_exception_handler(ClusterError, _handle_cluster_error)
+    app.add_exception_handler(SemanticError, _handle_semantic_error)
+
+
+def _build_embedder(settings: Settings, override: Embedder | None) -> Embedder | None:
+    """Return the embedder this node should use, if semantic search is enabled.
+
+    An override lets tests wire a deterministic embedder in place of a model, so
+    the semantic path is exercised without a download or model inference.
+    """
+    if override is not None:
+        return override
+    if not settings.semantic_enabled:
+        return None
+    return Model2VecEmbedder.load(settings.embedding_model, settings.embedding_model_revision)
 
 
 def _node_lifespan(
-    settings: Settings, node_links: Callable[[str], NodeLink] | None
+    settings: Settings,
+    node_links: Callable[[str], NodeLink] | None,
+    embedder: Embedder | None,
 ) -> Callable[[FastAPI], AbstractAsyncContextManager[None]]:
     """Build the startup/shutdown hook for a node that owns documents.
 
@@ -125,7 +153,7 @@ def _node_lifespan(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         store = SqliteDocumentStore.open(settings.storage_path)
-        engine = SearchEngine(store)
+        engine = SearchEngine(store, embedder=_build_embedder(settings, embedder))
         report = engine.initialize()
         app.state.engine = engine
 
@@ -136,6 +164,9 @@ def _node_lifespan(
                 "documents": report.document_count,
                 "generation": engine.generation,
                 "duration_ms": round(report.duration_seconds * 1000, 3),
+                "semantic_enabled": engine.semantic_enabled,
+                "vectors": report.vector_count,
+                "embedding_ms": round(report.semantic_duration_seconds * 1000, 3),
             },
         )
 
@@ -194,7 +225,7 @@ def _attach_replication_role(
 
 
 def _coordinator_lifespan(
-    settings: Settings, topology: ClusterTopology | None
+    settings: Settings, topology: ClusterTopology | None, embedder: Embedder | None
 ) -> Callable[[FastAPI], AbstractAsyncContextManager[None]]:
     """Build the startup/shutdown hook for a coordinator.
 
@@ -220,7 +251,13 @@ def _coordinator_lifespan(
                 ],
             )
 
-        app.state.coordinator = Coordinator(ShardRouter(settings.shard_count), cluster)
+        app.state.coordinator = Coordinator(
+            ShardRouter(settings.shard_count),
+            cluster,
+            # The coordinator embeds each query once, so every shard scores
+            # against an identical vector.
+            embedder=_build_embedder(settings, embedder),
+        )
         logger.info(
             "coordinator ready",
             extra={
@@ -244,6 +281,7 @@ def create_app(
     settings: Settings | None = None,
     topology: ClusterTopology | None = None,
     node_links: Callable[[str], NodeLink] | None = None,
+    embedder: Embedder | None = None,
 ) -> FastAPI:
     """Build a configured FastAPI application for this node's role.
 
@@ -270,12 +308,14 @@ def create_app(
     if settings.node_role == "coordinator":
         app = FastAPI(
             title=settings.app_name,
-            lifespan=_coordinator_lifespan(settings, topology),
+            lifespan=_coordinator_lifespan(settings, topology, embedder),
         )
         app.include_router(health_router)
         app.include_router(cluster_router)
     else:
-        app = FastAPI(title=settings.app_name, lifespan=_node_lifespan(settings, node_links))
+        app = FastAPI(
+            title=settings.app_name, lifespan=_node_lifespan(settings, node_links, embedder)
+        )
         app.include_router(health_router)
         app.include_router(readiness_router)
         if settings.node_role == "shard":
@@ -284,6 +324,7 @@ def create_app(
             app.include_router(documents_router)
             app.include_router(search_router)
             app.include_router(index_router)
+            app.include_router(semantic_router)
 
     app.state.settings = settings
     _register_error_handlers(app)

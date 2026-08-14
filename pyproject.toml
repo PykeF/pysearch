@@ -7,8 +7,14 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",
     "httpx2>=2.10.0",
+    "numpy>=2.5.2",
     "pydantic-settings>=2.6",
     "uvicorn[standard]>=0.32",
+]
+
+[project.optional-dependencies]
+semantic = [
+    "model2vec>=0.9.0",
 ]
 
 [dependency-groups]
@@ -27,7 +33,13 @@ packages = ["app"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--strict-markers --strict-config"
+# Tests needing the real embedding model are excluded by default, so a plain
+# `uv run pytest` never downloads a model or touches the network. Run them with
+# `uv run --extra semantic pytest -m semantic_model`.
+addopts = "--strict-markers --strict-config -m 'not semantic_model'"
+markers = [
+    "semantic_model: requires the real embedding model and the 'semantic' extra",
+]
 
 [tool.ruff]
 target-version = "py312"

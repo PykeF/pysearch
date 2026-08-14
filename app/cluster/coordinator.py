@@ -93,6 +93,8 @@ from app.search.analysis import analyze
 from app.search.document import Document
 from app.search.engine import SearchResults
 from app.search.index import CorpusStats, IndexStats, merge_corpus_stats
+from app.semantic.embedder import Embedder, SemanticIdentity
+from app.semantic.errors import SemanticDisabledError
 
 logger = logging.getLogger(__name__)
 
@@ -181,7 +183,12 @@ class ClusterHealth:
 class Coordinator:
     """Routes writes to one shard and fans searches out to all of them."""
 
-    def __init__(self, router: ShardRouter, topology: ClusterTopology) -> None:
+    def __init__(
+        self,
+        router: ShardRouter,
+        topology: ClusterTopology,
+        embedder: Embedder | None = None,
+    ) -> None:
         if topology.shard_count != router.shard_count:
             raise ValueError(
                 f"router expects {router.shard_count} shards but the topology has "
@@ -189,6 +196,9 @@ class Coordinator:
             )
         self._router = router
         self._topology = topology
+        # Present only when semantic search is enabled: the coordinator embeds
+        # each query once so every shard scores against an identical vector.
+        self._embedder = embedder
         # Guards the whole of a distributed operation. See the module docstring.
         self._lock = asyncio.Lock()
 
@@ -201,6 +211,16 @@ class Coordinator:
     def replication_factor(self) -> int:
         """Physical copies per logical shard."""
         return self._topology.replication_factor
+
+    @property
+    def semantic_enabled(self) -> bool:
+        """Whether this coordinator can answer semantic queries."""
+        return self._embedder is not None
+
+    @property
+    def semantic_identity(self) -> SemanticIdentity | None:
+        """The embedding space this cluster's semantic results live in."""
+        return self._embedder.identity if self._embedder is not None else None
 
     def shard_for(self, document_id: str) -> int:
         """Return the shard that owns a document."""
@@ -277,6 +297,67 @@ class Coordinator:
             )
 
         return self._merge(shard_results, limit)
+
+    async def semantic_search(self, query: str, limit: int) -> SearchResults:
+        """Search every logical shard by vector similarity and merge the results.
+
+        One fan-out round, where the lexical path needs two. BM25 needed a
+        statistics round because ``idf`` depends on corpus-wide ``N`` and ``df``,
+        so scores from different shards were incomparable until they shared
+        those numbers. A cosine similarity depends on nothing but the query
+        vector and the document vector, so comparability is a property of the
+        metric rather than something the coordinator has to arrange — and with
+        no second round there is no pinning problem either.
+
+        The query is embedded once here, so every shard scores against exactly
+        the same vector.
+
+        Raises:
+            SemanticDisabledError: if this coordinator has no embedder.
+            DistributedSearchError: if any logical shard has no usable copy.
+        """
+        if self._embedder is None:
+            raise SemanticDisabledError("semantic search is not enabled on this coordinator")
+
+        identity = self._embedder.identity
+        vector = self._embedder.embed_query(query).tolist()
+
+        async with self._lock:
+            shard_results = await self._gather(
+                [
+                    self._semantic_from_any_copy(copies, vector, limit, identity)
+                    for copies in self._topology
+                ],
+                "executing distributed semantic search",
+            )
+
+        return self._merge(shard_results, limit)
+
+    async def _semantic_from_any_copy(
+        self,
+        copies: ShardCopies,
+        vector: Sequence[float],
+        limit: int,
+        identity: SemanticIdentity,
+    ) -> SearchResults:
+        """Ask one serving copy of a logical shard, trying the primary first.
+
+        Exactly one copy answers per logical shard, so a replica never
+        contributes a second ranking for documents its primary already returned.
+        A copy that is not READY, or that embeds with a different model, refuses
+        and the next copy is tried.
+        """
+        failures: list[Exception] = []
+        for client in copies.serving_order:
+            try:
+                return await client.semantic_search(vector, limit, identity)
+            except ClusterError as error:
+                failures.append(error)
+
+        raise ShardCopiesExhaustedError(
+            f"every copy of logical shard {copies.shard_id} is unavailable",
+            shard_id=copies.shard_id,
+        ) from (failures[0] if failures else None)
 
     async def index_stats(self) -> ClusterStats:
         """Aggregate index statistics across the cluster."""

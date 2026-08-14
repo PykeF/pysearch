@@ -11,6 +11,8 @@ from typing import Literal
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.semantic.embedder import DEFAULT_MODEL_ID, DEFAULT_MODEL_REVISION
+
 Environment = Literal["local", "test", "production"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 NodeRole = Literal["single", "shard", "coordinator"]
@@ -79,6 +81,21 @@ class Settings(BaseSettings):
 
     #: Bound on one primary-to-replica replication call.
     replication_timeout: float = Field(default=2.0, gt=0.0)
+
+    #: Semantic retrieval is opt-in. Left off, no node loads an embedding model
+    #: and every path behaves exactly as it did before semantic search existed,
+    #: which is what keeps lexical-only deployments and the test suite light.
+    semantic_enabled: bool = False
+
+    #: The embedding model, pinned to an exact revision. A repository can move
+    #: while keeping its name, so the revision is part of the configuration
+    #: rather than left to whatever the default branch currently holds.
+    embedding_model: str = DEFAULT_MODEL_ID
+    embedding_model_revision: str = DEFAULT_MODEL_REVISION
+
+    #: There is deliberately no vector-dimension setting: it is a property of
+    #: the model, discovered when it loads. Configuring it would only create a
+    #: way for it to be wrong.
 
     connect_timeout: float = Field(default=1.0, gt=0.0)
     request_timeout: float = Field(default=2.0, gt=0.0)

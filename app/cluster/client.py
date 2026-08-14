@@ -20,6 +20,7 @@ from app.search.document import Document
 from app.search.engine import SearchResult, SearchResults
 from app.search.errors import DocumentNotFoundError
 from app.search.index import CorpusStats, IndexStats
+from app.semantic.embedder import SemanticIdentity
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +56,12 @@ class ShardClient(Protocol):
 
     async def corpus_stats(self, terms: Sequence[str]) -> CorpusStats:
         """Return this shard's contribution to the cluster's BM25 statistics."""
+        ...
+
+    async def semantic_search(
+        self, vector: Sequence[float], limit: int, identity: SemanticIdentity
+    ) -> SearchResults:
+        """Return this shard's local top ``limit`` by vector similarity."""
         ...
 
     async def index_stats(self) -> IndexStats:
@@ -133,6 +140,37 @@ class HttpShardClient:
             document_count=payload["document_count"],
             total_document_length=payload["total_document_length"],
             document_frequencies=payload["document_frequencies"],
+        )
+
+    async def semantic_search(
+        self, vector: Sequence[float], limit: int, identity: SemanticIdentity
+    ) -> SearchResults:
+        response = await self._request(
+            "POST",
+            "/internal/search/semantic",
+            json={
+                "vector": list(vector),
+                "limit": limit,
+                "identity": {
+                    "implementation": identity.implementation,
+                    "model_id": identity.model_id,
+                    "model_revision": identity.model_revision,
+                    "dimension": identity.dimension,
+                    "normalization": identity.normalization,
+                },
+            },
+        )
+        payload = response.json()
+        return SearchResults(
+            total=payload["total"],
+            results=tuple(
+                SearchResult(
+                    document_id=hit["document_id"],
+                    score=hit["score"],
+                    text=hit["text"],
+                )
+                for hit in payload["results"]
+            ),
         )
 
     async def index_stats(self) -> IndexStats:

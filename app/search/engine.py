@@ -57,13 +57,25 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 from app.search.analysis import analyze
 from app.search.document import Document
 from app.search.errors import DocumentNotFoundError, EngineNotReadyError, IndexInvariantError
 from app.search.index import CorpusStats, IndexStats, InvertedIndex
 from app.search.ranking import BM25Scorer
+from app.semantic.embedder import Embedder, SemanticIdentity
+from app.semantic.errors import SemanticDisabledError
+from app.semantic.vector_index import ExactVectorIndex
 from app.storage.base import DocumentStore
+
+if TYPE_CHECKING:  # pragma: no cover - imported for typing only
+    import numpy as np
+    from numpy.typing import NDArray
+
+#: Documents are embedded in batches during a rebuild, because a model call per
+#: document wastes most of the work a batched encoder can do.
+_EMBEDDING_BATCH_SIZE = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,10 +97,18 @@ class SearchResults:
 
 @dataclass(frozen=True, slots=True)
 class RebuildReport:
-    """The outcome of rebuilding derived state from storage."""
+    """The outcome of rebuilding derived state from storage.
+
+    Lexical and semantic rebuild times are reported separately because they
+    scale with different things: analysis with the token count, embedding with
+    the cost of the model. Keeping them apart is what makes the startup
+    trade-off measurable rather than a guess.
+    """
 
     document_count: int
     duration_seconds: float
+    semantic_duration_seconds: float = 0.0
+    vector_count: int = 0
 
 
 class NodeState(StrEnum):
@@ -127,11 +147,23 @@ class ReplicationOutcome(StrEnum):
 class SearchEngine:
     """Indexes documents durably and answers queries over derived state."""
 
-    def __init__(self, store: DocumentStore, scorer: BM25Scorer | None = None) -> None:
+    def __init__(
+        self,
+        store: DocumentStore,
+        scorer: BM25Scorer | None = None,
+        embedder: Embedder | None = None,
+    ) -> None:
         self._store = store
         self._index = InvertedIndex()
         self._documents: dict[str, Document] = {}
         self._scorer = scorer if scorer is not None else BM25Scorer()
+        # Semantic retrieval is opt-in. Without an embedder the engine is
+        # exactly the lexical engine of the earlier phases, and nothing in the
+        # write path or the rebuild does any extra work.
+        self._embedder = embedder
+        self._vectors = (
+            ExactVectorIndex(embedder.identity.dimension) if embedder is not None else None
+        )
         self._lock = threading.Lock()
         self._state = NodeState.STARTING
         self._detail = "not initialized"
@@ -220,9 +252,12 @@ class SearchEngine:
             StorageError: if the document could not be stored, in which case
                 nothing has changed anywhere.
         """
-        # Analysis is pure and touches no shared state, so it stays outside the
-        # critical section.
+        # Analysis and embedding are pure and touch no shared state, so they run
+        # outside the critical section — and, more importantly, *before* the
+        # durable write. Both are preconditions of the mutation: if either
+        # fails, nothing has been committed and nothing needs repairing.
         tokens = analyze(document.text)
+        vector = self._embed_document(document.text)
 
         with self._lock:
             self._require_operational_locked()
@@ -234,8 +269,7 @@ class SearchEngine:
             # cannot be undone by rolling storage back, so it degrades the
             # engine instead and leaves repair to a rebuild.
             with self._degrade_on_failure("failed to update derived state after a durable write"):
-                self._documents[document.document_id] = document
-                self._index.add_document(document.document_id, tokens)
+                self._apply_derived_locked(document, tokens, vector)
 
             return created
 
@@ -261,8 +295,7 @@ class SearchEngine:
             self._generation = generation
 
             with self._degrade_on_failure("failed to update derived state after a durable delete"):
-                del self._documents[document_id]
-                self._index.remove_document(document_id)
+                self._remove_derived_locked(document_id)
 
     # ------------------------------------------------------------------
     # Replication (replica side)
@@ -285,19 +318,25 @@ class SearchEngine:
         existed anywhere, yet would report the same generation as the primary
         and look perfectly synchronised.
         """
-        tokens = analyze(document.text)
-
         with self._lock:
             outcome = self._classify_generation_locked(generation)
             if outcome is not ReplicationOutcome.APPLIED:
                 return outcome
 
+            # Derived values are computed before the durable write here too, so
+            # a replica that cannot embed a document fails the replication
+            # rather than committing it and advancing its generation. A replica
+            # must never look synchronized while its semantic state is missing.
+            # The generation is checked first, so a redelivery or a gap costs no
+            # model inference.
+            tokens = analyze(document.text)
+            vector = self._embed_document(document.text)
+
             self._store.put(document, generation)
             with self._degrade_on_failure(
                 "failed to update derived state after a replicated write"
             ):
-                self._documents[document.document_id] = document
-                self._index.add_document(document.document_id, tokens)
+                self._apply_derived_locked(document, tokens, vector)
             self._generation = generation
             return outcome
 
@@ -319,8 +358,7 @@ class SearchEngine:
                 "failed to update derived state after a replicated delete"
             ):
                 if document_id in self._documents:
-                    del self._documents[document_id]
-                    self._index.remove_document(document_id)
+                    self._remove_derived_locked(document_id)
             self._generation = generation
             return outcome
 
@@ -371,6 +409,101 @@ class SearchEngine:
 
         self._require_operational_locked()
         return ReplicationOutcome.APPLIED
+
+    # ------------------------------------------------------------------
+    # Semantic retrieval
+    # ------------------------------------------------------------------
+
+    @property
+    def semantic_enabled(self) -> bool:
+        """Whether this engine maintains vectors and can answer semantic queries."""
+        return self._embedder is not None
+
+    @property
+    def vector_count(self) -> int | None:
+        """How many documents have a vector, or ``None`` when semantic is disabled."""
+        with self._lock:
+            return self._vectors.count if self._vectors is not None else None
+
+    @property
+    def semantic_identity(self) -> SemanticIdentity | None:
+        """What this engine embeds with, or ``None`` when semantic is disabled."""
+        return self._embedder.identity if self._embedder is not None else None
+
+    def embed_query(self, text: str) -> "NDArray[np.float32]":
+        """Embed a query for this engine's vector space.
+
+        Used by a single node answering its own semantic queries; in a cluster
+        the coordinator embeds once and sends the vector instead.
+
+        Raises:
+            SemanticDisabledError: if semantic search is not enabled here.
+            EmbeddingError: if the model fails.
+        """
+        if self._embedder is None:
+            raise SemanticDisabledError("semantic search is not enabled on this node")
+        return self._embedder.embed_query(text)
+
+    def semantic_search(self, vector: "NDArray[np.float32]", limit: int) -> SearchResults:
+        """Return the ``limit`` most similar documents to a query vector.
+
+        Ordering is by descending similarity, then ascending document id — the
+        same tie-break as the lexical path, so results are fully determined by
+        the data.
+
+        Unlike BM25, the score depends only on the two vectors and not on any
+        corpus-level statistic, which is why distributed semantic search needs
+        no statistics round.
+
+        Raises:
+            SemanticDisabledError: if semantic search is not enabled here.
+            EngineNotReadyError: if this copy is not READY.
+        """
+        with self._lock:
+            self._require_operational_locked()
+            if self._vectors is None:
+                raise SemanticDisabledError("semantic search is not enabled on this node")
+
+            hits = self._vectors.search(vector, limit)
+            results = tuple(
+                SearchResult(
+                    document_id=hit.document_id,
+                    score=hit.score,
+                    text=self._documents[hit.document_id].text,
+                )
+                for hit in hits
+            )
+            return SearchResults(total=self._vectors.count, results=results)
+
+    def _embed_document(self, text: str) -> "NDArray[np.float32] | None":
+        """Embed one document, or return ``None`` when semantic is disabled.
+
+        Raises:
+            EmbeddingError: if the model fails, before anything is committed.
+        """
+        if self._embedder is None:
+            return None
+        embedded: NDArray[np.float32] = self._embedder.embed_documents([text])[0]
+        return embedded
+
+    def _apply_derived_locked(
+        self,
+        document: Document,
+        tokens: Sequence[str],
+        vector: "NDArray[np.float32] | None",
+    ) -> None:
+        """Reflect a committed mutation in every derived structure. Caller holds the lock."""
+        self._documents[document.document_id] = document
+        self._index.add_document(document.document_id, tokens)
+        if self._vectors is not None and vector is not None:
+            self._vectors.add(document.document_id, vector)
+
+    def _remove_derived_locked(self, document_id: str) -> None:
+        """Drop a document from every derived structure. Caller holds the lock."""
+        del self._documents[document_id]
+        self._index.remove_document(document_id)
+        if self._vectors is not None:
+            self._vectors.remove(document_id)
 
     # ------------------------------------------------------------------
     # Querying
@@ -468,6 +601,13 @@ class SearchEngine:
                     "the document cache and the index hold different documents"
                 )
 
+            if self._vectors is not None:
+                self._vectors.validate()
+                if self._vectors.document_ids() != set(self._documents):
+                    raise IndexInvariantError(
+                        "the vector index and the document cache hold different documents"
+                    )
+
             stored_generation = self._store.generation()
             if stored_generation != self._generation:
                 raise IndexInvariantError(
@@ -513,14 +653,43 @@ class SearchEngine:
             index.add_document(document.document_id, analyze(document.text))
 
         index.validate()
+        lexical_seconds = time.perf_counter() - started
+
+        # Vectors are derived state like the index, so they are rebuilt from the
+        # authoritative documents rather than persisted. That keeps documents the
+        # only durable corpus and removes any question of stale vectors written
+        # by a different model — at the cost of re-embedding on every start,
+        # which is why the two rebuild times are reported separately.
+        semantic_started = time.perf_counter()
+        vectors = self._rebuild_vectors(documents)
+        semantic_seconds = time.perf_counter() - semantic_started
 
         self._index = index
         self._documents = documents
+        self._vectors = vectors
         self._generation = self._store.generation()
         return RebuildReport(
             document_count=len(documents),
-            duration_seconds=time.perf_counter() - started,
+            duration_seconds=lexical_seconds,
+            semantic_duration_seconds=semantic_seconds,
+            vector_count=vectors.count if vectors is not None else 0,
         )
+
+    def _rebuild_vectors(self, documents: dict[str, Document]) -> ExactVectorIndex | None:
+        """Re-embed the corpus into a fresh vector index, in batches."""
+        if self._embedder is None:
+            return None
+
+        vectors = ExactVectorIndex(self._embedder.identity.dimension)
+        document_ids = sorted(documents)
+        for start in range(0, len(document_ids), _EMBEDDING_BATCH_SIZE):
+            batch = document_ids[start : start + _EMBEDDING_BATCH_SIZE]
+            embedded = self._embedder.embed_documents([documents[key].text for key in batch])
+            for document_id, vector in zip(batch, embedded, strict=True):
+                vectors.add(document_id, vector)
+
+        vectors.validate()
+        return vectors
 
     def _require_operational_locked(self) -> None:
         """Refuse to serve unless this copy is READY. Caller holds the lock.

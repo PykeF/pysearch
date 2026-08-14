@@ -7,6 +7,10 @@
 #
 #   docker compose up --build
 #   curl localhost:8000/cluster/status
+#   curl 'localhost:8000/search/semantic?q=car+maintenance'
+#
+# First start downloads the pinned embedding model (~30 MB) into each node's
+# volume.
 #
 # Every physical node gets its own volume. A primary and its replica pointed at
 # one database would be two views of a single copy, which is not replication.
@@ -18,6 +22,11 @@ x-node: &node
     PYSEARCH_LOG_LEVEL: INFO
     PYSEARCH_SHARD_COUNT: "3"
     PYSEARCH_STORAGE_PATH: /data/pysearch.db
+    # Semantic retrieval is off by default in the application; the demo
+    # topology turns it on so both search modes are reachable. Every node —
+    # including the coordinator, which embeds each query once — loads the same
+    # pinned model, and each derives its own vectors from the documents.
+    PYSEARCH_SEMANTIC_ENABLED: "true"
   restart: unless-stopped
 
 x-healthcheck: &healthcheck
