@@ -2,9 +2,13 @@
 
     uv run python scripts/run_cluster.py
 
-Starts one uvicorn process per shard plus a coordinator, each with its own
-database, waits for the cluster to report ready, and prints the coordinator's
-address. Ctrl-C stops everything.
+Starts one uvicorn process per physical node plus a coordinator, each with its
+own database, waits for the cluster to report ready, and prints the
+coordinator's address. Ctrl-C stops everything.
+
+With ``--replication-factor 2`` every logical shard gets a primary and a
+replica, which is the topology that survives losing a node: kill a primary and
+search keeps working from its replica, while writes to that shard start failing.
 
 The point is that the distributed system does not depend on Docker: these are
 ordinary OS processes talking real HTTP over real sockets. Compose packages the
@@ -60,8 +64,15 @@ def wait_until_ready(url: str, timeout: float = READY_TIMEOUT_SECONDS) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--shards", type=int, default=3, help="number of shard nodes")
-    parser.add_argument("--base-port", type=int, default=9000, help="first shard port")
+    parser.add_argument("--shards", type=int, default=3, help="number of logical shards")
+    parser.add_argument(
+        "--replication-factor",
+        type=int,
+        default=1,
+        choices=(1, 2),
+        help="physical copies per logical shard",
+    )
+    parser.add_argument("--base-port", type=int, default=9000, help="first primary port")
     parser.add_argument("--coordinator-port", type=int, default=8000)
     parser.add_argument(
         "--data-dir",
@@ -81,30 +92,66 @@ def main() -> int:
 
     processes: list[subprocess.Popen[bytes]] = []
     shard_urls = []
+    replica_urls = []
+    replicated = arguments.replication_factor > 1
 
     try:
         for shard_id in range(arguments.shards):
-            port = arguments.base_port + shard_id
-            shard_urls.append(f"http://127.0.0.1:{port}")
+            primary_port = arguments.base_port + shard_id
+            replica_port = arguments.base_port + 100 + shard_id
+            primary_url = f"http://127.0.0.1:{primary_port}"
+            replica_url = f"http://127.0.0.1:{replica_port}"
+            shard_urls.append(primary_url)
+
             processes.append(
                 start_node(
-                    port,
+                    primary_port,
                     {
-                        "PYSEARCH_APP_NAME": f"pysearch-shard-{shard_id}",
+                        "PYSEARCH_APP_NAME": f"pysearch-shard-{shard_id}-primary",
+                        "PYSEARCH_NODE_ID": f"shard-{shard_id}-primary",
                         "PYSEARCH_NODE_ROLE": "shard",
                         "PYSEARCH_SHARD_ID": str(shard_id),
                         "PYSEARCH_SHARD_COUNT": str(arguments.shards),
-                        # One database per shard, never shared.
-                        "PYSEARCH_STORAGE_PATH": str(data_dir / f"shard-{shard_id}.db"),
+                        "PYSEARCH_REPLICA_ROLE": "primary",
+                        "PYSEARCH_REPLICA_URLS": replica_url if replicated else "",
+                        # One database per physical node, never shared.
+                        "PYSEARCH_STORAGE_PATH": str(data_dir / f"shard-{shard_id}-primary.db"),
+                    },
+                )
+            )
+            if replicated:
+                replica_urls.append(replica_url)
+
+        # Primaries first: a replica verifies itself against its primary while
+        # starting up, and will refuse to serve if it cannot reach one.
+        for shard_id, url in enumerate(shard_urls):
+            if not wait_until_ready(f"{url}/ready"):
+                print(f"shard {shard_id} primary did not become ready", file=sys.stderr)
+                return 1
+            print(f"shard {shard_id} primary ready at {url}")
+
+        for shard_id, _ in enumerate(replica_urls):
+            processes.append(
+                start_node(
+                    arguments.base_port + 100 + shard_id,
+                    {
+                        "PYSEARCH_APP_NAME": f"pysearch-shard-{shard_id}-replica",
+                        "PYSEARCH_NODE_ID": f"shard-{shard_id}-replica",
+                        "PYSEARCH_NODE_ROLE": "shard",
+                        "PYSEARCH_SHARD_ID": str(shard_id),
+                        "PYSEARCH_SHARD_COUNT": str(arguments.shards),
+                        "PYSEARCH_REPLICA_ROLE": "replica",
+                        "PYSEARCH_PRIMARY_URL": shard_urls[shard_id],
+                        "PYSEARCH_STORAGE_PATH": str(data_dir / f"shard-{shard_id}-replica.db"),
                     },
                 )
             )
 
-        for shard_id, url in enumerate(shard_urls):
+        for shard_id, url in enumerate(replica_urls):
             if not wait_until_ready(f"{url}/ready"):
-                print(f"shard {shard_id} did not become ready", file=sys.stderr)
+                print(f"shard {shard_id} replica did not become ready", file=sys.stderr)
                 return 1
-            print(f"shard {shard_id} ready at {url}")
+            print(f"shard {shard_id} replica ready at {url}")
 
         processes.append(
             start_node(
@@ -114,6 +161,7 @@ def main() -> int:
                     "PYSEARCH_NODE_ROLE": "coordinator",
                     "PYSEARCH_SHARD_COUNT": str(arguments.shards),
                     "PYSEARCH_SHARD_URLS": ",".join(shard_urls),
+                    "PYSEARCH_REPLICA_URLS": ";".join(replica_urls),
                 },
             )
         )
@@ -124,6 +172,7 @@ def main() -> int:
             return 1
 
         print(f"\ncluster ready: {coordinator_url}")
+        print(f"logical shards: {arguments.shards}, copies each: {arguments.replication_factor}")
         print(f"data directory: {data_dir}")
         print("press Ctrl-C to stop\n")
 

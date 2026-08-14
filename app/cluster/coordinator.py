@@ -46,14 +46,34 @@ top-k once scores are comparable: if a document is in the global top-k, fewer
 than k documents outrank it anywhere, so fewer than k outrank it on its own
 shard, so it is in that shard's local top-k. Nothing can be missed.
 
+Replication and failover
+------------------------
+
+Each logical shard may have several physical copies. Statistics and scoring are
+taken from **exactly one** copy per logical shard, never from every replica —
+counting a replica separately would double every document in N and df.
+
+Copy selection happens during round 1: the primary is tried first, then each
+replica, until one answers. A copy that is not READY answers 503, so an
+unverified, recovering or out-of-sync replica is skipped automatically rather
+than being trusted.
+
+The copy that answered round 1 is **pinned** for round 2. Copies can differ by
+mutations that were never acknowledged, so pairing statistics from one copy with
+scoring from another could produce a ranking matching no corpus that ever
+existed. If a pinned copy disappears between rounds the query fails instead.
+
 Failure
 -------
 
-If any shard fails to take part, the whole query fails. Under cluster-wide
-statistics a missing shard corrupts N, avgdl and df, so partial results would be
-both incomplete and mis-scored. Without replication there is also nothing that
-could recover the missing documents, so partial availability would buy nothing
-real. Nothing incomplete is ever returned as though it were complete.
+If every copy of a logical shard fails, the whole query fails. Under
+cluster-wide statistics a missing shard corrupts N, avgdl and df, so partial
+results would be both incomplete and mis-scored. Nothing incomplete is ever
+returned as though it were complete.
+
+Writes go only to the configured primary and are never rerouted to a replica.
+There is no automatic promotion, so a lost primary means writes to that logical
+shard fail while reads keep working from a replica.
 """
 
 import asyncio
@@ -61,13 +81,18 @@ import logging
 from collections.abc import Awaitable, Sequence
 from dataclasses import dataclass
 
-from app.cluster.client import ShardClient
-from app.cluster.errors import DistributedSearchError
+from app.cluster.client import NodeStatus, ShardClient
+from app.cluster.errors import (
+    ClusterError,
+    DistributedSearchError,
+    ShardCopiesExhaustedError,
+)
 from app.cluster.routing import ShardRouter
+from app.cluster.topology import ClusterTopology, ShardCopies
 from app.search.analysis import analyze
 from app.search.document import Document
 from app.search.engine import SearchResults
-from app.search.index import CorpusStats, merge_corpus_stats
+from app.search.index import CorpusStats, IndexStats, merge_corpus_stats
 
 logger = logging.getLogger(__name__)
 
@@ -115,23 +140,67 @@ class ClusterReadiness:
         return f"shards not ready: {list(self.unready_shards)}"
 
 
+@dataclass(frozen=True, slots=True)
+class CopyStatus:
+    """One physical copy of a logical shard, as reported operationally."""
+
+    role: str
+    reachable: bool
+    node_id: str
+    state: str
+    ready: bool
+    generation: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class ShardHealth:
+    """What one logical shard can currently do.
+
+    Search and write availability are reported separately because they now
+    genuinely differ: losing a primary leaves a logical shard readable through
+    its replica but not writable, since nothing is promoted automatically.
+    """
+
+    shard_id: int
+    copies: tuple[CopyStatus, ...]
+    search_available: bool
+    write_available: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ClusterHealth:
+    """The cluster's capability, shard by shard."""
+
+    shard_count: int
+    replication_factor: int
+    search_available: bool
+    write_available: bool
+    shards: tuple[ShardHealth, ...]
+
+
 class Coordinator:
     """Routes writes to one shard and fans searches out to all of them."""
 
-    def __init__(self, router: ShardRouter, clients: Sequence[ShardClient]) -> None:
-        if len(clients) != router.shard_count:
+    def __init__(self, router: ShardRouter, topology: ClusterTopology) -> None:
+        if topology.shard_count != router.shard_count:
             raise ValueError(
-                f"router expects {router.shard_count} shards but {len(clients)} clients were given"
+                f"router expects {router.shard_count} shards but the topology has "
+                f"{topology.shard_count}"
             )
         self._router = router
-        self._clients = tuple(clients)
+        self._topology = topology
         # Guards the whole of a distributed operation. See the module docstring.
         self._lock = asyncio.Lock()
 
     @property
     def shard_count(self) -> int:
-        """The number of shards in the cluster."""
+        """The number of logical shards in the cluster."""
         return self._router.shard_count
+
+    @property
+    def replication_factor(self) -> int:
+        """Physical copies per logical shard."""
+        return self._topology.replication_factor
 
     def shard_for(self, document_id: str) -> int:
         """Return the shard that owns a document."""
@@ -158,7 +227,9 @@ class Coordinator:
         )
 
         async with self._lock:
-            return await self._clients[shard_id].put_document(document)
+            # The configured primary, never a replica: rerouting a write would
+            # mean two nodes had accepted writes for one logical shard.
+            return await self._topology.primary_for(shard_id).put_document(document)
 
     async def delete_document(self, document_id: str) -> None:
         """Delete a document from its owning shard.
@@ -173,7 +244,7 @@ class Coordinator:
         )
 
         async with self._lock:
-            await self._clients[shard_id].delete_document(document_id)
+            await self._topology.primary_for(shard_id).delete_document(document_id)
 
     # ------------------------------------------------------------------
     # Querying
@@ -195,10 +266,15 @@ class Coordinator:
         unique_terms = sorted(set(terms))
 
         async with self._lock:
-            corpus_stats = await self._collect_corpus_stats(unique_terms)
+            # Round 1 both collects statistics and decides which physical copy
+            # of each logical shard is serving this query.
+            selection = await self._select_and_collect(unique_terms)
+            corpus_stats = merge_corpus_stats(stats for _, stats in selection)
             if corpus_stats.document_count == 0:
                 return SearchResults(total=0, results=())
-            shard_results = await self._fan_out_search(query, limit, corpus_stats)
+            shard_results = await self._fan_out_search(
+                query, limit, corpus_stats, [client for client, _ in selection]
+            )
 
         return self._merge(shard_results, limit)
 
@@ -206,7 +282,7 @@ class Coordinator:
         """Aggregate index statistics across the cluster."""
         async with self._lock:
             per_shard = await self._gather(
-                [client.index_stats() for client in self._clients],
+                [self._index_stats_from_any_copy(copies) for copies in self._topology],
                 "collecting index statistics",
             )
 
@@ -239,7 +315,8 @@ class Coordinator:
         queued behind a slow search would report staleness as unreadiness.
         """
         outcomes = await asyncio.gather(
-            *(client.is_ready() for client in self._clients), return_exceptions=True
+            *(self._shard_has_serving_copy(copies) for copies in self._topology),
+            return_exceptions=True,
         )
 
         ready: list[int] = []
@@ -256,26 +333,145 @@ class Coordinator:
             unready_shards=tuple(unready),
         )
 
+    async def cluster_status(self) -> ClusterHealth:
+        """Report each logical shard's copies and what the cluster can do.
+
+        Deliberately not taken under the operation lock: an operator asking why
+        the cluster is unhappy should not have to queue behind the traffic they
+        are investigating.
+        """
+        shards = await asyncio.gather(*(self._shard_health(copies) for copies in self._topology))
+
+        return ClusterHealth(
+            shard_count=self.shard_count,
+            replication_factor=self.replication_factor,
+            search_available=all(shard.search_available for shard in shards),
+            write_available=all(shard.write_available for shard in shards),
+            shards=tuple(shards),
+        )
+
+    async def _shard_health(self, copies: ShardCopies) -> ShardHealth:
+        """Ask every copy of one logical shard how it is doing."""
+        roles = ["primary", *["replica"] * len(copies.replicas)]
+        outcomes = await asyncio.gather(
+            *(client.node_status() for client in copies.serving_order),
+            return_exceptions=True,
+        )
+
+        statuses: list[CopyStatus] = []
+        for role, outcome in zip(roles, outcomes, strict=True):
+            if isinstance(outcome, NodeStatus):
+                statuses.append(
+                    CopyStatus(
+                        role=role,
+                        reachable=True,
+                        node_id=outcome.node_id,
+                        state=outcome.state,
+                        ready=outcome.ready,
+                        generation=outcome.generation,
+                    )
+                )
+            else:
+                statuses.append(
+                    CopyStatus(
+                        role=role,
+                        reachable=False,
+                        node_id="",
+                        state="unreachable",
+                        ready=False,
+                        generation=None,
+                    )
+                )
+
+        return ShardHealth(
+            shard_id=copies.shard_id,
+            copies=tuple(statuses),
+            search_available=any(status.ready for status in statuses),
+            # Only the configured primary may accept writes, so a ready replica
+            # does not make a logical shard writable.
+            write_available=statuses[0].ready,
+        )
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
-    async def _collect_corpus_stats(self, terms: Sequence[str]) -> CorpusStats:
-        """Round one: sum every shard's statistics into cluster-wide ones."""
-        parts = await self._gather(
-            [client.corpus_stats(terms) for client in self._clients],
+    async def _select_and_collect(
+        self, terms: Sequence[str]
+    ) -> Sequence[tuple[ShardClient, CorpusStats]]:
+        """Round one: pick one serving copy per logical shard and read its statistics.
+
+        Exactly one copy per logical shard contributes, so a replica never
+        double-counts its primary's documents.
+        """
+        return await self._gather(
+            [self._stats_from_any_copy(copies, terms) for copies in self._topology],
             "collecting corpus statistics",
         )
-        return merge_corpus_stats(parts)
+
+    async def _stats_from_any_copy(
+        self, copies: ShardCopies, terms: Sequence[str]
+    ) -> tuple[ShardClient, CorpusStats]:
+        """Try each copy of a logical shard until one answers.
+
+        A copy that is not READY refuses with 503 and is skipped, which is how
+        an unsynchronised replica is kept out of the serving set without the
+        coordinator having to reason about generations itself.
+        """
+        failures: list[Exception] = []
+        for client in copies.serving_order:
+            try:
+                return client, await client.corpus_stats(terms)
+            except ClusterError as error:
+                failures.append(error)
+
+        raise ShardCopiesExhaustedError(
+            f"every copy of logical shard {copies.shard_id} is unavailable",
+            shard_id=copies.shard_id,
+        ) from (failures[0] if failures else None)
 
     async def _fan_out_search(
-        self, query: str, limit: int, corpus_stats: CorpusStats
+        self,
+        query: str,
+        limit: int,
+        corpus_stats: CorpusStats,
+        pinned: Sequence[ShardClient],
     ) -> Sequence[SearchResults]:
-        """Round two: every shard scores its own documents with cluster statistics."""
+        """Round two: the copies that answered round one score with cluster statistics.
+
+        Pinned deliberately. Failing over to a different copy here could pair
+        statistics from one corpus state with scoring from another, so a copy
+        that disappears between rounds fails the query instead.
+        """
         return await self._gather(
-            [client.search(query, limit, corpus_stats) for client in self._clients],
+            [client.search(query, limit, corpus_stats) for client in pinned],
             "executing distributed search",
         )
+
+    async def _index_stats_from_any_copy(self, copies: ShardCopies) -> IndexStats:
+        """Read one logical shard's index statistics from any serving copy."""
+        failures: list[Exception] = []
+        for client in copies.serving_order:
+            try:
+                return await client.index_stats()
+            except ClusterError as error:
+                failures.append(error)
+
+        raise ShardCopiesExhaustedError(
+            f"every copy of logical shard {copies.shard_id} is unavailable",
+            shard_id=copies.shard_id,
+        ) from (failures[0] if failures else None)
+
+    @staticmethod
+    async def _shard_has_serving_copy(copies: ShardCopies) -> bool:
+        """Whether at least one copy of a logical shard can serve searches."""
+        for client in copies.serving_order:
+            try:
+                if await client.is_ready():
+                    return True
+            except ClusterError:
+                continue
+        return False
 
     @staticmethod
     def _merge(shard_results: Sequence[SearchResults], limit: int) -> SearchResults:

@@ -26,7 +26,7 @@ def document(document_id: str, text: str = "distributed search") -> Document:
 
 
 def test_put_then_get_returns_the_document(document_store: DocumentStore) -> None:
-    assert document_store.put(document("doc-1")) is True
+    assert document_store.put(document("doc-1"), generation=1) is True
 
     stored = document_store.get("doc-1")
 
@@ -38,13 +38,13 @@ def test_get_returns_none_for_an_unknown_document(document_store: DocumentStore)
 
 
 def test_put_reports_creation_then_replacement(document_store: DocumentStore) -> None:
-    assert document_store.put(document("doc-1", "first")) is True
-    assert document_store.put(document("doc-1", "second")) is False
+    assert document_store.put(document("doc-1", "first"), generation=1) is True
+    assert document_store.put(document("doc-1", "second"), generation=1) is False
 
 
 def test_replacement_overwrites_the_text(document_store: DocumentStore) -> None:
-    document_store.put(document("doc-1", "first"))
-    document_store.put(document("doc-1", "second"))
+    document_store.put(document("doc-1", "first"), generation=1)
+    document_store.put(document("doc-1", "second"), generation=1)
 
     stored = document_store.get("doc-1")
 
@@ -54,15 +54,15 @@ def test_replacement_overwrites_the_text(document_store: DocumentStore) -> None:
 
 
 def test_delete_reports_whether_the_document_existed(document_store: DocumentStore) -> None:
-    document_store.put(document("doc-1"))
+    document_store.put(document("doc-1"), generation=1)
 
-    assert document_store.delete("doc-1") is True
-    assert document_store.delete("doc-1") is False
+    assert document_store.delete("doc-1", generation=2) is True
+    assert document_store.delete("doc-1", generation=2) is False
 
 
 def test_delete_removes_the_document(document_store: DocumentStore) -> None:
-    document_store.put(document("doc-1"))
-    document_store.delete("doc-1")
+    document_store.put(document("doc-1"), generation=1)
+    document_store.delete("doc-1", generation=2)
 
     assert document_store.get("doc-1") is None
     assert document_store.count() == 0
@@ -71,8 +71,8 @@ def test_delete_removes_the_document(document_store: DocumentStore) -> None:
 def test_count_tracks_stored_documents(document_store: DocumentStore) -> None:
     assert document_store.count() == 0
 
-    document_store.put(document("doc-1"))
-    document_store.put(document("doc-2"))
+    document_store.put(document("doc-1"), generation=1)
+    document_store.put(document("doc-2"), generation=1)
 
     assert document_store.count() == 2
 
@@ -81,7 +81,7 @@ def test_iteration_yields_every_document_in_a_stable_order(
     document_store: DocumentStore,
 ) -> None:
     for document_id in ("doc-c", "doc-a", "doc-b"):
-        document_store.put(document(document_id, f"text for {document_id}"))
+        document_store.put(document(document_id, f"text for {document_id}"), generation=1)
 
     first_pass = list(document_store.iter_documents())
     second_pass = list(document_store.iter_documents())
@@ -95,7 +95,7 @@ def test_iteration_over_an_empty_store_yields_nothing(document_store: DocumentSt
 
 
 def test_empty_text_is_stored_verbatim(document_store: DocumentStore) -> None:
-    document_store.put(document("doc-1", ""))
+    document_store.put(document("doc-1", ""), generation=1)
 
     stored = document_store.get("doc-1")
 
@@ -104,7 +104,7 @@ def test_empty_text_is_stored_verbatim(document_store: DocumentStore) -> None:
 
 
 def test_unicode_text_survives_a_round_trip(document_store: DocumentStore) -> None:
-    document_store.put(document("doc-1", "分布式搜索 — naïve café ß"))
+    document_store.put(document("doc-1", "分布式搜索 — naïve café ß"), generation=1)
 
     stored = document_store.get("doc-1")
 
@@ -119,8 +119,8 @@ def test_unicode_text_survives_a_round_trip(document_store: DocumentStore) -> No
 
 def test_documents_survive_closing_and_reopening(storage_path: Path) -> None:
     store = SqliteDocumentStore.open(storage_path)
-    store.put(document("doc-1", "distributed search"))
-    store.put(document("doc-2", "ranking function"))
+    store.put(document("doc-1", "distributed search"), generation=1)
+    store.put(document("doc-2", "ranking function"), generation=1)
     store.close()
 
     reopened = SqliteDocumentStore.open(storage_path)
@@ -135,9 +135,9 @@ def test_documents_survive_closing_and_reopening(storage_path: Path) -> None:
 
 def test_deletions_survive_reopening(storage_path: Path) -> None:
     store = SqliteDocumentStore.open(storage_path)
-    store.put(document("doc-1"))
-    store.put(document("doc-2"))
-    store.delete("doc-1")
+    store.put(document("doc-1"), generation=1)
+    store.put(document("doc-2"), generation=1)
+    store.delete("doc-1", generation=2)
     store.close()
 
     reopened = SqliteDocumentStore.open(storage_path)
@@ -150,8 +150,8 @@ def test_deletions_survive_reopening(storage_path: Path) -> None:
 
 def test_replacements_survive_reopening(storage_path: Path) -> None:
     store = SqliteDocumentStore.open(storage_path)
-    store.put(document("doc-1", "before"))
-    store.put(document("doc-1", "after"))
+    store.put(document("doc-1", "before"), generation=1)
+    store.put(document("doc-1", "after"), generation=1)
     store.close()
 
     reopened = SqliteDocumentStore.open(storage_path)
@@ -188,7 +188,7 @@ def test_using_a_closed_store_raises_a_storage_error(storage_path: Path) -> None
     store.close()
 
     with pytest.raises(StorageError):
-        store.put(document("doc-1"))
+        store.put(document("doc-1"), generation=1)
 
 
 def test_storage_errors_do_not_leak_sql(storage_path: Path) -> None:

@@ -4,16 +4,19 @@ Every fixture that touches storage uses pytest's ``tmp_path``, so tests never
 depend on developer-machine state and never share a database.
 """
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
 import httpx2
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.cluster.client import HttpShardClient
+from app.cluster.replication import HttpNodeLink
+from app.cluster.topology import build_topology
 from app.core.config import Settings
 from app.main import create_app
 from app.search.document import Document
@@ -31,17 +34,28 @@ class InMemoryDocumentStore:
 
     def __init__(self) -> None:
         self._documents: dict[str, Document] = {}
+        self._generation = 0
 
-    def put(self, document: Document) -> bool:
+    def put(self, document: Document, generation: int) -> bool:
         created = document.document_id not in self._documents
         self._documents[document.document_id] = document
+        self._generation = generation
         return created
 
     def get(self, document_id: str) -> Document | None:
         return self._documents.get(document_id)
 
-    def delete(self, document_id: str) -> bool:
-        return self._documents.pop(document_id, None) is not None
+    def delete(self, document_id: str, generation: int) -> bool:
+        existed = self._documents.pop(document_id, None) is not None
+        self._generation = generation
+        return existed
+
+    def replace_all(self, documents: Iterable[Document], generation: int) -> None:
+        self._documents = {document.document_id: document for document in documents}
+        self._generation = generation
+
+    def generation(self) -> int:
+        return self._generation
 
     def iter_documents(self) -> Iterator[Document]:
         for document_id in sorted(self._documents):
@@ -126,74 +140,141 @@ CLUSTER_SHARD_COUNT = 3
 
 @dataclass
 class Cluster:
-    """A running coordinator and the shard applications behind it."""
+    """A running coordinator and the physical shard nodes behind it."""
 
     client: TestClient
     shard_paths: tuple[Path, ...]
+    nodes: dict[str, FastAPI]
 
 
-def make_shard_settings(shard_id: int, directory: Path) -> Settings:
-    """Settings for one shard node, with its own database."""
+def make_shard_settings(
+    shard_id: int,
+    directory: Path,
+    replica_role: str = "primary",
+    replicas: Sequence[str] = (),
+    primary_url: str = "",
+) -> Settings:
+    """Settings for one physical shard node, with its own database."""
+    suffix = "primary" if replica_role == "primary" else "replica"
     return Settings(
-        app_name=f"pysearch-shard-{shard_id}",
+        app_name=f"pysearch-shard-{shard_id}-{suffix}",
+        node_id=f"shard-{shard_id}-{suffix}",
         environment="test",
         log_level="WARNING",
         node_role="shard",
         shard_id=shard_id,
         shard_count=CLUSTER_SHARD_COUNT,
-        storage_path=directory / f"shard-{shard_id}.db",
+        replica_role=replica_role,  # type: ignore[arg-type]
+        replica_urls=",".join(replicas),
+        primary_url=primary_url,
+        storage_path=directory / f"shard-{shard_id}-{suffix}.db",
     )
 
 
-def make_coordinator_settings() -> Settings:
+def make_coordinator_settings(replication_factor: int = 1) -> Settings:
     """Settings for a coordinator over the shard topology."""
+    replica_urls = ""
+    if replication_factor > 1:
+        replica_urls = ";".join(
+            f"http://shard-{shard}-replica" for shard in range(CLUSTER_SHARD_COUNT)
+        )
     return Settings(
         app_name="pysearch-coordinator",
         environment="test",
         log_level="WARNING",
         node_role="coordinator",
         shard_count=CLUSTER_SHARD_COUNT,
-        shard_urls=",".join(f"http://shard-{n}" for n in range(CLUSTER_SHARD_COUNT)),
+        shard_urls=",".join(f"http://shard-{n}-primary" for n in range(CLUSTER_SHARD_COUNT)),
+        replica_urls=replica_urls,
     )
 
 
-def launch_cluster(stack: ExitStack, directory: Path) -> Cluster:
-    """Bring up shard applications and a coordinator wired to them.
+def asgi_client(app: FastAPI, base_url: str) -> httpx2.AsyncClient:
+    """An async client that reaches an in-process application over real HTTP."""
+    return httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url=base_url)
 
-    Each shard is a real application with its own engine and its own SQLite
-    file, reached over real HTTP through an ASGI transport: routing,
-    serialization, status codes and error translation all execute, without
-    sockets, ports or timing.
+
+def launch_cluster(stack: ExitStack, directory: Path, replication_factor: int = 1) -> Cluster:
+    """Bring up shard nodes and a coordinator wired to them.
+
+    Each physical node is a real application with its own engine and its own
+    SQLite file. Nodes reach each other over real HTTP through ASGI transports —
+    ``TestClient`` is itself an httpx client, so a primary's synchronous
+    replication call runs the replica's full request stack — which means
+    routing, replication, serialization, status codes and error translation all
+    execute, without sockets, ports or timing.
     """
-    shard_clients: list[HttpShardClient] = []
+    primaries: list[HttpShardClient] = []
+    replicas: list[list[HttpShardClient]] = []
     shard_paths: list[Path] = []
+    nodes: dict[str, FastAPI] = {}
+    apps_by_url: dict[str, FastAPI] = {}
+
+    def link_to(url: str) -> HttpNodeLink:
+        """A synchronous peer link into whichever in-process app owns that URL."""
+        return HttpNodeLink(url, TestClient(apps_by_url[url]))
 
     for shard_id in range(CLUSTER_SHARD_COUNT):
-        settings = make_shard_settings(shard_id, directory)
-        shard_paths.append(settings.storage_path)
-        shard_app = create_app(settings)
-        # Entering the TestClient runs the shard's lifespan, which opens its
-        # database and rebuilds its index.
-        stack.enter_context(TestClient(shard_app))
+        primary_url = f"http://shard-{shard_id}-primary"
+        replica_url = f"http://shard-{shard_id}-replica"
+        replicated = replication_factor > 1
 
-        base_url = f"http://shard-{shard_id}"
-        http = httpx2.AsyncClient(transport=httpx2.ASGITransport(app=shard_app), base_url=base_url)
-        shard_clients.append(HttpShardClient(base_url, http))
+        primary_settings = make_shard_settings(
+            shard_id,
+            directory,
+            replica_role="primary",
+            replicas=[replica_url] if replicated else [],
+        )
+        shard_paths.append(primary_settings.storage_path)
+        primary_app = create_app(primary_settings, node_links=link_to)
+        apps_by_url[primary_url] = primary_app
+        nodes[f"shard-{shard_id}-primary"] = primary_app
 
-    coordinator = TestClient(create_app(make_coordinator_settings(), shard_clients=shard_clients))
+        replica_app: FastAPI | None = None
+        if replicated:
+            replica_settings = make_shard_settings(
+                shard_id, directory, replica_role="replica", primary_url=primary_url
+            )
+            shard_paths.append(replica_settings.storage_path)
+            replica_app = create_app(replica_settings, node_links=link_to)
+            apps_by_url[replica_url] = replica_app
+            nodes[f"shard-{shard_id}-replica"] = replica_app
+
+        # The primary starts first: a replica verifies itself against its
+        # primary during its own startup, so the primary has to be answering by
+        # then or the replica will refuse to serve.
+        stack.enter_context(TestClient(primary_app))
+        if replica_app is not None:
+            stack.enter_context(TestClient(replica_app))
+
+        primaries.append(HttpShardClient(primary_url, asgi_client(primary_app, primary_url)))
+        if replica_app is not None:
+            replicas.append([HttpShardClient(replica_url, asgi_client(replica_app, replica_url))])
+
+    topology = build_topology(primaries=primaries, replicas=replicas)
+    coordinator = TestClient(
+        create_app(make_coordinator_settings(replication_factor), topology=topology)
+    )
     stack.enter_context(coordinator)
-    return Cluster(client=coordinator, shard_paths=tuple(shard_paths))
+    return Cluster(client=coordinator, shard_paths=tuple(shard_paths), nodes=nodes)
 
 
 @pytest.fixture
 def cluster(tmp_path: Path) -> Iterator[Cluster]:
-    """A three-shard cluster with an empty corpus."""
+    """A three-shard cluster with one copy per shard and an empty corpus."""
     with ExitStack() as stack:
         yield launch_cluster(stack, tmp_path)
 
 
 @pytest.fixture
-def start_cluster() -> Callable[[ExitStack, Path], Cluster]:
+def replicated_cluster(tmp_path: Path) -> Iterator[Cluster]:
+    """A three-shard cluster with a primary and a replica per logical shard."""
+    with ExitStack() as stack:
+        yield launch_cluster(stack, tmp_path, replication_factor=2)
+
+
+@pytest.fixture
+def start_cluster() -> Callable[..., Cluster]:
     """The cluster launcher, for tests that start and stop clusters themselves."""
     return launch_cluster
 

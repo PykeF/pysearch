@@ -2,14 +2,18 @@
 
 An educational distributed search engine, written from scratch in Python.
 
-> **Current status: Phase 3 — distributed search.**
-> PySearch is a working distributed lexical search engine. Documents are
-> partitioned across shard nodes by a stable hash, each shard owns its own
-> durable SQLite corpus and its own in-memory index, and a coordinator fans
-> queries out in parallel and merges a global top-k. Distributed ranking is
-> equivalent to a single node holding the whole corpus. There is **no
-> replication and no failover** — losing a shard fails queries — and no
-> semantic search. Those are the roadmap below, not features of this code.
+> **Current status: Phase 4 — replication and availability.**
+> PySearch is a working replicated distributed lexical search engine. Documents
+> are partitioned across logical shards by a stable hash; each logical shard has
+> a primary and a replica, each with its own durable SQLite corpus and in-memory
+> index; and a coordinator fans queries out in parallel, failing over to a
+> replica when a primary is lost. Distributed ranking is equivalent to a single
+> node holding the whole corpus, before and after failover.
+>
+> **Reads fail over automatically; writes do not.** There is no leader election
+> and no automatic promotion, so losing a primary means that logical shard stops
+> accepting writes until it returns. There is no semantic search. Those are the
+> roadmap below, not features of this code.
 
 ## Motivation
 
@@ -26,7 +30,7 @@ effort stays on the parts worth understanding.
 
 ## What exists today
 
-**Implemented (Phases 0–3)**
+**Implemented (Phases 0–4)**
 
 - Unicode-aware text normalization and tokenization, shared by documents and queries
 - An in-memory inverted index with posting lists and term frequencies
@@ -36,18 +40,23 @@ effort stays on the parts worth understanding.
 - A durable document corpus in SQLite, with transactional writes
 - Startup recovery: the index and document cache are rebuilt from storage
 - Liveness and readiness endpoints, with an explicit degraded state
-- **Deterministic sharding across multiple nodes, with a coordinator**
-- **Parallel query fan-out and a deterministic global top-k merge**
-- **Cluster-wide BM25 statistics, so distributed ranking matches single-node**
+- Deterministic sharding across multiple nodes, with a coordinator
+- Parallel query fan-out and a deterministic global top-k merge
+- Cluster-wide BM25 statistics, so distributed ranking matches single-node
+- **Synchronous write-all replication with a contiguous mutation sequence**
+- **Automatic read failover to a verified-synchronized replica**
+- **Replica resynchronization, with unverified copies refusing to serve**
+- **Cluster status separating search availability from write availability**
 - **Docker Compose topology for reproducible multi-node local deployment**
 - HTTP APIs for indexing, deletion, search and index statistics
 - Structured JSON logging carrying node role and shard id
-- 283 tests, strict type checking, linting and formatting gates
+- 333 tests, strict type checking, linting and formatting gates
 
-**Not implemented** — replication, failover, leader election, consensus,
-dynamic membership, rebalancing, index snapshots, query caching, phrase or
-fuzzy search, stemming, embeddings, vector search, hybrid retrieval,
-authentication. See the roadmap.
+**Not implemented** — leader election, consensus, automatic primary promotion,
+writable failover, multi-primary writes, dynamic membership, rebalancing,
+coordinator replication, index snapshots, query caching, phrase or fuzzy
+search, stemming, embeddings, vector search, hybrid retrieval, authentication.
+See the roadmap.
 
 ## Architecture
 
@@ -347,6 +356,170 @@ indexing, because indexing pays one fsync per document while recovery is a singl
 sequential read. Snapshots would only become worth their consistency cost once
 this column stops being acceptable.
 
+## Replication and availability
+
+### Logical shards versus physical nodes
+
+```text
+                            Client
+                              |
+                      +-------v--------+
+                      |  Coordinator   |   topology only; owns no documents
+                      +---+--------+---+
+                          |        |
+              logical shard 0      logical shard 1        ...
+               /          \          /         \
+          primary      replica   primary     replica
+             |            |         |           |
+        shard-0-p.db  shard-0-r.db  ...       ...        six separate databases
+```
+
+A **logical shard** is a deterministic subset of documents. A **physical node**
+is one process with one database. Routing keys on the logical shard, so adding
+or removing replicas moves no documents at all — `replication_factor` never
+enters the hash.
+
+### Write-all replication
+
+**A 2xx means the document is durable on the primary *and* on every configured
+replica of its logical shard.** Nothing weaker.
+
+```text
+coordinator -> primary: durable commit (generation N+1)
+                  -> replica: apply(generation N+1), durable commit
+               <- acknowledge
+```
+
+Primary-first ordering is deliberate: it guarantees
+`generation(primary) >= generation(replica)` always, so the primary is the most
+advanced copy, is always the correct recovery source, and there is never a
+question about which copy is newer.
+
+Synchronous rather than asynchronous, for a specific reason: a lagging replica
+holds a *different* corpus, so global statistics read from it would be wrong and
+failover would silently change the ranking. Write-all makes every READY copy
+interchangeable, which is exactly what makes read failover safe.
+
+The price is stated rather than hidden: **if any replica is unavailable, writes
+to that logical shard fail.**
+
+| Situation | Response | State |
+| --- | --- | --- |
+| Primary and replica commit | 201/200 | fully replicated |
+| Primary unavailable | 503 | nothing written anywhere |
+| **Primary commits, replica fails** | **503** | **durable on the primary only** |
+| Response lost after commit | client cannot tell | retry is safe; `PUT` is idempotent |
+
+That third row is the honest one: **an error does not prove the write did not
+land.** Retrying is safe, and the replica is behind until it resynchronizes.
+
+### Generations
+
+Each logical shard carries a **contiguous mutation sequence number**, persisted
+in the *same SQLite transaction* as the mutation itself. A replica applies:
+
+| Incoming | Action |
+| --- | --- |
+| `local + 1` | apply and advance |
+| `<= local` | already applied — idempotent success, so retries are safe |
+| `> local + 1` | **gap: refuse, and stop serving** |
+
+Refusing the gap is the point. A replica that applied generation 6 while missing
+5 would hold a corpus that never existed anywhere, yet would report the same
+generation as its primary and look perfectly synchronized. Equality is only
+evidence of synchronization because numbers cannot be skipped.
+
+This is **not** a consensus term or epoch. It confers no authority and elects
+nobody; it is a sequence number.
+
+### Node states
+
+```text
+STARTING -> RECOVERING -> READY
+                 ^          |
+                 |          v
+                 +---- OUT_OF_SYNC / DEGRADED
+```
+
+Only **READY** serves. Every other state refuses search, statistics and
+scoring, which is how an unverified or out-of-sync copy is kept out of the
+serving set — the coordinator does not have to reason about generations itself,
+it simply skips a copy that says no.
+
+### Read failover
+
+Copy selection happens during round 1 of the two-round search: the primary is
+tried first, then each replica, until one answers. **That copy is pinned for
+round 2.** If it disappears between rounds the query fails rather than switching,
+because copies can differ by unacknowledged mutations and pairing statistics
+from one with scoring from another could produce a ranking matching no corpus
+that ever existed.
+
+Statistics come from **exactly one copy per logical shard**, so six physical
+copies of a 5-document corpus still report `N = 5`, not 10.
+
+| Failure | Search | Writes |
+| --- | --- | --- |
+| Primary down, replica READY | **works**, identical results | **fail** (503) |
+| Replica down | works | **fail** (503) — write-all |
+| Replica out of sync | works via primary | work |
+| Every copy of a shard down | **503** | fail |
+
+### Write failover: deliberately absent
+
+There is **no leader election and no automatic promotion**. Safe automatic
+promotion needs proof the replica is caught up *and* fencing so the old primary
+cannot return and accept writes — that is consensus, and a half-built version
+would be worse than none. Primary identity is static configuration, and the
+roles are enforced structurally: a replica has no write path at all and answers
+409, while a primary refuses replicated mutations. Two writable primaries
+cannot arise.
+
+### Recovery
+
+A replica proves itself before serving:
+
+```text
+local recovery -> compare generation with the primary
+     equal      -> READY
+     behind     -> RECOVERING -> full resync -> rebuild -> validate -> READY
+     unreachable-> NOT READY
+```
+
+That last line matters: a replica that cannot reach its primary **stays out of
+service**. Claiming readiness without evidence would let it answer searches from
+a corpus it cannot vouch for.
+
+Recovery is a **full resynchronization** from the primary, not a replication
+log: `GET /internal/export` returns a snapshot taken under the primary's lock —
+microseconds, since the corpus is already in memory — so a recovering replica
+never stitches together documents from different moments, and no write pause is
+needed. The storage write is one transaction, so a failed resync leaves the
+previous corpus intact rather than a mixture of two.
+
+### Consistency guarantee, stated concretely
+
+> **Every write that returned 2xx is durably present on every configured copy of
+> its logical shard.** A read served by any READY copy therefore reflects every
+> acknowledged write. A write that returned an error may be present on the
+> primary only; whether such a document appears depends on which copy served the
+> query, and no guarantee was made about it.
+
+No "strong" or "eventual" without saying what they mean.
+
+### Cluster status
+
+`GET /cluster/status` reports each logical shard's copies with their role,
+state and generation, plus `search_available` and `write_available` separately —
+because after losing a primary those genuinely differ.
+
+### Security scope
+
+The `/internal/*` endpoints — including replication and export — assume a
+**trusted internal network**. They have no authentication and must not be
+exposed to the public internet. Nothing about them is secure; saying otherwise
+would be false.
+
 ## Distributed search
 
 ### Roles
@@ -354,7 +527,8 @@ this column stops being acceptable.
 | Role | Serves | Owns |
 | --- | --- | --- |
 | `single` (default) | the full public API | its own corpus |
-| `shard` | `/internal/*`, `/health`, `/ready` | its slice of the corpus |
+| `shard` + `primary` | `/internal/*`, `/health`, `/ready` | its logical shard, and writes to it |
+| `shard` + `replica` | `/internal/*` (no write path), `/health`, `/ready` | a copy of its logical shard |
 | `coordinator` | the full public API | nothing but the topology |
 
 A shard deliberately exposes **no public `/search`**. Querying one shard directly
@@ -570,6 +744,9 @@ Let `T` be the tokens in a document, `U` its unique terms, `V` the vocabulary,
 | Distributed write | one network round trip + the local work above | routed to a single owning shard |
 | Distributed search | 2 parallel fan-outs; latency ≈ the slowest shard | rounds are sequential, shards within a round are not |
 | Global merge | O(S·k log(S·k)) | `S` shards each returning `k` candidates |
+| Replicated write | primary commit + one call per replica | write latency now includes replication |
+| Replicated search | unchanged | one serving copy per logical shard, never every replica |
+| Resynchronization | O(documents in the logical shard) | full snapshot transfer and index rebuild |
 
 The query cost is the whole point of an inverted index: it is proportional to
 how many documents contain the query terms, not to `N`. A term absent from the
@@ -662,8 +839,17 @@ No containers needed — these are ordinary OS processes talking real HTTP:
 uv run python scripts/run_cluster.py
 ```
 
-It starts three shards and a coordinator, each with its own database, waits for
-readiness, and prints the coordinator's address. Then:
+Add a replica per logical shard:
+
+```bash
+uv run python scripts/run_cluster.py --replication-factor 2
+```
+
+It starts the shard nodes and a coordinator, each with its own database, waits
+for readiness, and prints the coordinator's address. To watch failover, kill one
+primary process and search again — results are unchanged, while writes to that
+logical shard start returning 503. `GET /cluster/status` shows which copy is
+serving. Then:
 
 ```bash
 curl -X PUT localhost:8000/documents/doc-1 -H 'content-type: application/json' -d '{"text": "distributed search"}'
@@ -677,9 +863,11 @@ The response names the shard that took the write.
 docker compose up --build
 ```
 
-The coordinator is published on port 8000; each shard keeps its own named
-volume, because two shards sharing a database would be sharing a corpus rather
-than partitioning one. The coordinator has no volume: it owns no documents.
+The coordinator is published on port 8000. Seven services come up: three
+primaries, three replicas and the coordinator. **Every physical node keeps its
+own named volume** — a primary and its replica sharing a database would be two
+views of one copy, which is not replication. The coordinator has no volume: it
+owns no documents.
 
 **These Docker commands are unverified.** Docker is not installed on the machine
 this was developed on, so the image has never been built here. The distributed
@@ -720,8 +908,13 @@ override them locally; `.env` is git-ignored.
 | `PYSEARCH_SHARD_COUNT` | `1` | shards in the cluster; fixed for its lifetime |
 | `PYSEARCH_SHARD_ID` | — | required on a shard; must be in `[0, shard_count)` |
 | `PYSEARCH_SHARD_URLS` | — | required on a coordinator; comma-separated, indexed by shard id |
+| `PYSEARCH_REPLICA_ROLE` | — | `primary` or `replica`; required on a shard node |
+| `PYSEARCH_REPLICA_URLS` | — | replicas: `;` between logical shards, `,` within one |
+| `PYSEARCH_PRIMARY_URL` | — | required on a replica, so it can verify and resynchronize |
+| `PYSEARCH_NODE_ID` | — | stable name for logs and cluster status |
 | `PYSEARCH_CONNECT_TIMEOUT` | `1.0` | seconds |
-| `PYSEARCH_REQUEST_TIMEOUT` | `2.0` | seconds |
+| `PYSEARCH_REQUEST_TIMEOUT` | `2.0` | seconds, coordinator to node |
+| `PYSEARCH_REPLICATION_TIMEOUT` | `2.0` | seconds, primary to replica |
 
 Inconsistent topologies fail at startup rather than in flight: a shard without
 an id, a shard id outside the shard count, a coordinator without URLs, a URL
@@ -780,18 +973,20 @@ explicit degraded state, and readiness reporting. Index snapshots and an
 application-level write-ahead log were both evaluated and deliberately not
 built; the reasoning is above.
 
-### Phase 3 — Distributed search ✅ *current*
+### Phase 3 — Distributed search ✅
 
 Shard nodes and a coordinator, BLAKE2b modulo routing, an internal HTTP node
 API, parallel fan-out, cluster-wide BM25 statistics, deterministic global top-k
 merging, a fail-whole partial-failure policy, and a Docker Compose topology for
 reproducible multi-node local deployment.
 
-### Phase 4 — Reliability and scalability
+### Phase 4 — Replication and availability ✅ *current*
 
-Replication, health checks, heartbeats, failure detection, replica selection,
-failover, rebalancing, query caching, and backpressure — with the emphasis on
-understanding failure modes and trade-offs.
+Logical shards separated from physical nodes, synchronous write-all replication
+with contiguous generations, automatic read failover, replica resynchronization,
+split-brain prevention by static roles, and a capability-aware cluster status.
+Leader election and automatic promotion were evaluated and deliberately not
+built; the reasoning is above.
 
 ### Phase 5 — Semantic and vector search
 
@@ -834,10 +1029,12 @@ app/
 │   ├── errors.py     StorageError, StorageInitializationError
 │   └── sqlite_store.py
 └── cluster/          distributed logic — no FastAPI in here either
-    ├── routing.py    stable hash routing
+    ├── routing.py    stable hash routing onto logical shards
+    ├── topology.py   logical shards and the physical copies holding them
     ├── client.py     the ShardClient protocol and its HTTP implementation
-    ├── coordinator.py fan-out, global statistics, merge, failure policy
-    └── errors.py     ShardUnavailableError, ShardTimeoutError, ...
+    ├── replication.py write-all replication and replica synchronization
+    ├── coordinator.py fan-out, global statistics, merge, failover policy
+    └── errors.py     ShardUnavailableError, ReplicationError, ...
 scripts/
 ├── demo.py              runnable walkthrough, including a restart
 ├── rebuild_benchmark.py startup recovery cost by corpus size
@@ -847,8 +1044,27 @@ tests/unit/           analysis, index, ranking, engine, storage, persistence
 tests/integration/    the HTTP API, and restart recovery
 ```
 
-Modules for replication and cluster membership will be created when the phase
+Modules for cluster membership and rebalancing will be created when the phase
 that needs them begins — not in advance.
+
+## Known limitations
+
+Stated plainly, because each is a real consequence of a deliberate choice:
+
+- **Writes need every copy.** One replica down stops writes to that logical
+  shard. Read availability was bought with write availability.
+- **No automatic write failover.** A lost primary means no writes for that shard
+  until it returns; recovering write capacity is an operator action.
+- **The coordinator is a single point of failure.** Replication improved shard
+  availability and nothing else.
+- **A failed write may still be durable on the primary.** The copies then differ
+  until the replica resynchronizes.
+- **A replica cannot recover while its primary is down.** There is no other
+  authoritative source, and guessing which stale copy is newest would be worse.
+- **Resynchronization transfers the whole logical shard** and materializes it in
+  one response; there is no incremental catch-up log.
+- **Internal endpoints are unauthenticated** and assume a trusted network.
+- **The shard count and replication factor are fixed** for a cluster's life.
 
 ## Independence and attribution
 

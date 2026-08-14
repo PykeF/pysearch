@@ -10,16 +10,23 @@ reports whether the document existed — in one atomic statement instead of two
 round trips.
 """
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from typing import Protocol
 
 from app.search.document import Document
 
 
 class DocumentStore(Protocol):
-    """Durable storage for the document corpus."""
+    """Durable storage for the document corpus.
 
-    def put(self, document: Document) -> bool:
+    Every mutation carries the generation it advances the copy to, and the two
+    are committed in one transaction. Persisting them separately would allow a
+    crash to leave a document without its generation or the reverse, and the
+    whole point of the generation is that it describes exactly which mutations
+    a copy has applied.
+    """
+
+    def put(self, document: Document, generation: int) -> bool:
         """Store a document, replacing any document with the same id.
 
         Returns:
@@ -31,12 +38,25 @@ class DocumentStore(Protocol):
         """Return a document, or ``None`` if it is not stored."""
         ...
 
-    def delete(self, document_id: str) -> bool:
+    def delete(self, document_id: str, generation: int) -> bool:
         """Remove a document.
 
         Returns:
             ``True`` if a document was removed, ``False`` if none existed.
         """
+        ...
+
+    def replace_all(self, documents: Iterable[Document], generation: int) -> None:
+        """Replace the entire corpus in one transaction.
+
+        Used by resynchronisation. Atomicity matters here more than anywhere:
+        a resync that failed half way through would leave a copy holding a
+        mixture of two corpora while claiming a single generation.
+        """
+        ...
+
+    def generation(self) -> int:
+        """Return the mutation sequence number this copy has applied up to."""
         ...
 
     def iter_documents(self) -> Iterator[Document]:

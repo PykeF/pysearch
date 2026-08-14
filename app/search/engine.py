@@ -56,6 +56,7 @@ import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import StrEnum
 
 from app.search.analysis import analyze
 from app.search.document import Document
@@ -90,12 +91,37 @@ class RebuildReport:
     duration_seconds: float
 
 
+class NodeState(StrEnum):
+    """The serving state of one physical copy.
+
+    Only ``READY`` may serve traffic. The others exist so that a copy which is
+    unverified, mid-recovery or known to have missed a mutation cannot be
+    selected for search, statistics or failover.
+    """
+
+    STARTING = "starting"
+    RECOVERING = "recovering"
+    READY = "ready"
+    DEGRADED = "degraded"
+    OUT_OF_SYNC = "out_of_sync"
+
+
 @dataclass(frozen=True, slots=True)
 class EngineStatus:
     """Whether the engine can serve requests, and why not if it cannot."""
 
+    state: NodeState
     ready: bool
     detail: str
+    generation: int
+
+
+class ReplicationOutcome(StrEnum):
+    """What a replica did with a replicated mutation."""
+
+    APPLIED = "applied"
+    DUPLICATE = "duplicate"
+    GAP = "gap"
 
 
 class SearchEngine:
@@ -107,8 +133,9 @@ class SearchEngine:
         self._documents: dict[str, Document] = {}
         self._scorer = scorer if scorer is not None else BM25Scorer()
         self._lock = threading.Lock()
-        self._initialized = False
-        self._degraded_reason: str | None = None
+        self._state = NodeState.STARTING
+        self._detail = "not initialized"
+        self._generation = 0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -121,30 +148,62 @@ class SearchEngine:
         by anything that wants to repair a degraded engine in place. Recovery is
         never lazy: no request can observe a half-built index.
 
+        A replica calls :meth:`mark_recovering` immediately afterwards, because
+        local recovery alone does not prove it holds everything its primary has.
+
         Raises:
             StorageError: if the corpus cannot be read.
             IndexInvariantError: if the rebuilt index is inconsistent.
         """
         with self._lock:
             report = self._rebuild_locked()
-            self._initialized = True
-            self._degraded_reason = None
+            self._state = NodeState.READY
+            self._detail = "ready"
         return report
 
     def close(self) -> None:
         """Close the underlying storage and stop serving."""
         with self._lock:
-            self._initialized = False
+            self._state = NodeState.STARTING
+            self._detail = "closed"
             self._store.close()
 
     def status(self) -> EngineStatus:
-        """Report whether the engine is ready to serve."""
+        """Report this copy's serving state and generation."""
         with self._lock:
-            if self._degraded_reason is not None:
-                return EngineStatus(ready=False, detail=f"degraded: {self._degraded_reason}")
-            if not self._initialized:
-                return EngineStatus(ready=False, detail="not initialized")
-            return EngineStatus(ready=True, detail="ready")
+            ready = self._state is NodeState.READY
+            return EngineStatus(
+                state=self._state,
+                ready=ready,
+                # Non-serving states name themselves, so a readiness response
+                # says why it is refusing rather than only that it refuses.
+                detail=self._detail if ready else f"{self._state}: {self._detail}",
+                generation=self._generation,
+            )
+
+    @property
+    def generation(self) -> int:
+        """The mutation sequence number this copy has applied up to."""
+        with self._lock:
+            return self._generation
+
+    def mark_recovering(self, detail: str) -> None:
+        """Stop serving while synchronisation with the primary is unverified."""
+        with self._lock:
+            self._state = NodeState.RECOVERING
+            self._detail = detail
+
+    def mark_out_of_sync(self, detail: str) -> None:
+        """Stop serving because this copy is known to have missed a mutation."""
+        with self._lock:
+            self._state = NodeState.OUT_OF_SYNC
+            self._detail = detail
+
+    def mark_ready(self) -> None:
+        """Begin serving, after synchronisation has been verified."""
+        with self._lock:
+            self._state = NodeState.READY
+            self._detail = "ready"
 
     # ------------------------------------------------------------------
     # Mutation
@@ -167,7 +226,9 @@ class SearchEngine:
 
         with self._lock:
             self._require_operational_locked()
-            created = self._store.put(document)
+            generation = self._generation + 1
+            created = self._store.put(document, generation)
+            self._generation = generation
 
             # Past this point the durable corpus has changed. A failure here
             # cannot be undone by rolling storage back, so it degrades the
@@ -189,12 +250,127 @@ class SearchEngine:
         with self._lock:
             self._require_operational_locked()
 
-            if not self._store.delete(document_id):
+            # Checked against the cache first, because a delete that matches
+            # nothing must not consume a generation: generations number the
+            # mutations a copy has applied, and a no-op is not one of them.
+            if document_id not in self._documents:
                 raise DocumentNotFoundError(f"document {document_id!r} is not indexed")
+
+            generation = self._generation + 1
+            self._store.delete(document_id, generation)
+            self._generation = generation
 
             with self._degrade_on_failure("failed to update derived state after a durable delete"):
                 del self._documents[document_id]
                 self._index.remove_document(document_id)
+
+    # ------------------------------------------------------------------
+    # Replication (replica side)
+    # ------------------------------------------------------------------
+
+    def apply_replicated_put(self, document: Document, generation: int) -> ReplicationOutcome:
+        """Apply a mutation replicated from the primary.
+
+        Generations form a contiguous sequence, and that is the whole point:
+        equality with the primary can only be read as evidence of
+        synchronisation if a copy cannot skip a number. So exactly one value is
+        acceptable, and anything beyond it means a mutation was missed.
+
+        ``generation == local + 1``   apply it and advance
+        ``generation <= local``       a redelivery; already applied, so succeed
+        ``generation >  local + 1``   a gap: refuse, and stop serving
+
+        Refusing the gap matters more than applying the newest data. A copy that
+        applied generation 6 while missing 5 would hold a corpus that never
+        existed anywhere, yet would report the same generation as the primary
+        and look perfectly synchronised.
+        """
+        tokens = analyze(document.text)
+
+        with self._lock:
+            outcome = self._classify_generation_locked(generation)
+            if outcome is not ReplicationOutcome.APPLIED:
+                return outcome
+
+            self._store.put(document, generation)
+            with self._degrade_on_failure(
+                "failed to update derived state after a replicated write"
+            ):
+                self._documents[document.document_id] = document
+                self._index.add_document(document.document_id, tokens)
+            self._generation = generation
+            return outcome
+
+    def apply_replicated_delete(self, document_id: str, generation: int) -> ReplicationOutcome:
+        """Apply a replicated deletion.
+
+        Deliberately a no-op when the document is absent rather than an error.
+        The public API answers 404 for a missing document, but a replica may
+        legitimately not hold one — so replication treats "already gone" as
+        success instead of manufacturing a failure the primary cannot act on.
+        """
+        with self._lock:
+            outcome = self._classify_generation_locked(generation)
+            if outcome is not ReplicationOutcome.APPLIED:
+                return outcome
+
+            self._store.delete(document_id, generation)
+            with self._degrade_on_failure(
+                "failed to update derived state after a replicated delete"
+            ):
+                if document_id in self._documents:
+                    del self._documents[document_id]
+                    self._index.remove_document(document_id)
+            self._generation = generation
+            return outcome
+
+    def export_snapshot(self) -> tuple[tuple[Document, ...], int]:
+        """Return a consistent snapshot of this copy's corpus and generation.
+
+        Taken under the lock, but only long enough to copy references to
+        documents already held in memory — microseconds — so a resynchronising
+        replica never stitches together documents from different moments, and
+        no write pause is needed to give it a coherent view.
+        """
+        with self._lock:
+            self._require_operational_locked()
+            return tuple(self._documents.values()), self._generation
+
+    def resynchronize(self, documents: Sequence[Document], generation: int) -> RebuildReport:
+        """Replace this copy's corpus wholesale with a snapshot from the primary.
+
+        The storage write is one transaction, so a failure part-way leaves the
+        previous corpus intact rather than a mixture of two. Derived state is
+        then rebuilt and validated before the copy is allowed to serve again.
+        """
+        with self._lock:
+            self._state = NodeState.RECOVERING
+            self._detail = f"resynchronizing to generation {generation}"
+
+            self._store.replace_all(documents, generation)
+            report = self._rebuild_locked()
+
+            if self._generation != generation:
+                raise IndexInvariantError(
+                    f"resynchronization expected generation {generation} but storage "
+                    f"reports {self._generation}"
+                )
+
+            self._state = NodeState.READY
+            self._detail = "ready"
+            return report
+
+    def _classify_generation_locked(self, generation: int) -> ReplicationOutcome:
+        """Decide what to do with an incoming generation. Caller holds the lock."""
+        if generation <= self._generation:
+            return ReplicationOutcome.DUPLICATE
+        if generation > self._generation + 1:
+            self._state = NodeState.OUT_OF_SYNC
+            self._detail = f"generation gap: local {self._generation}, received {generation}"
+            return ReplicationOutcome.GAP
+
+        self._require_operational_locked()
+        return ReplicationOutcome.APPLIED
 
     # ------------------------------------------------------------------
     # Querying
@@ -292,6 +468,13 @@ class SearchEngine:
                     "the document cache and the index hold different documents"
                 )
 
+            stored_generation = self._store.generation()
+            if stored_generation != self._generation:
+                raise IndexInvariantError(
+                    f"storage is at generation {stored_generation} but the engine "
+                    f"believes it is at {self._generation}"
+                )
+
             stored_count = self._store.count()
             if stored_count != len(self._documents):
                 raise IndexInvariantError(
@@ -333,17 +516,21 @@ class SearchEngine:
 
         self._index = index
         self._documents = documents
+        self._generation = self._store.generation()
         return RebuildReport(
             document_count=len(documents),
             duration_seconds=time.perf_counter() - started,
         )
 
     def _require_operational_locked(self) -> None:
-        """Refuse to serve unless initialized and healthy. Caller holds the lock."""
-        if self._degraded_reason is not None:
-            raise EngineNotReadyError(f"engine is degraded: {self._degraded_reason}")
-        if not self._initialized:
-            raise EngineNotReadyError("engine is not initialized")
+        """Refuse to serve unless this copy is READY. Caller holds the lock.
+
+        Every non-READY state — unverified, recovering, degraded, out of sync —
+        is refused here, which is what keeps an unsynchronised copy from being
+        used for statistics, scoring or failover.
+        """
+        if self._state is not NodeState.READY:
+            raise EngineNotReadyError(f"engine is {self._state}: {self._detail}")
 
     @contextmanager
     def _degrade_on_failure(self, reason: str) -> Iterator[None]:
@@ -356,7 +543,8 @@ class SearchEngine:
         try:
             yield
         except Exception as error:
-            self._degraded_reason = reason
+            self._state = NodeState.DEGRADED
+            self._detail = reason
             # Reported as a degradation rather than as the original error: the
             # outcome that matters to the caller is that the engine can no
             # longer be trusted, and the request that tripped it should get the

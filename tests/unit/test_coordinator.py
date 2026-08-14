@@ -9,13 +9,15 @@ from collections.abc import Sequence
 
 import pytest
 
+from app.cluster.client import NodeStatus
 from app.cluster.coordinator import Coordinator
 from app.cluster.errors import DistributedSearchError, ShardTimeoutError, ShardUnavailableError
 from app.cluster.routing import ShardRouter
+from app.cluster.topology import build_topology
 from app.search.document import Document
 from app.search.engine import SearchEngine, SearchResult, SearchResults
 from app.search.errors import DocumentNotFoundError
-from app.search.index import CorpusStats
+from app.search.index import CorpusStats, IndexStats
 from app.storage.sqlite_store import IN_MEMORY, SqliteDocumentStore
 
 
@@ -50,13 +52,24 @@ class FakeShardClient:
         self._guard("corpus_stats")
         return self.engine.corpus_stats(terms)
 
-    async def index_stats(self):  # type: ignore[no-untyped-def]
+    async def index_stats(self) -> IndexStats:
         self._guard("index_stats")
         return self.engine.stats()
 
     async def is_ready(self) -> bool:
         self.calls.append("is_ready")
         return self.ready
+
+    async def node_status(self) -> NodeStatus:
+        self._guard("node_status")
+        return NodeStatus(
+            node_id="fake",
+            shard_id=0,
+            replica_role="primary",
+            state="ready" if self.ready else "recovering",
+            ready=self.ready,
+            generation=self.engine.generation,
+        )
 
 
 @pytest.fixture
@@ -66,7 +79,7 @@ def shards() -> list[FakeShardClient]:
 
 @pytest.fixture
 def coordinator(shards: list[FakeShardClient]) -> Coordinator:
-    return Coordinator(ShardRouter(shard_count=3), shards)
+    return Coordinator(ShardRouter(shard_count=3), build_topology(shards, []))
 
 
 def run(awaitable):  # type: ignore[no-untyped-def]
@@ -81,7 +94,7 @@ def run(awaitable):  # type: ignore[no-untyped-def]
 
 def test_client_count_must_match_the_shard_count() -> None:
     with pytest.raises(ValueError, match="expects 3 shards"):
-        Coordinator(ShardRouter(shard_count=3), [FakeShardClient()])
+        Coordinator(ShardRouter(shard_count=3), build_topology([FakeShardClient()], []))
 
 
 # ----------------------------------------------------------------------
@@ -268,9 +281,10 @@ def test_repeated_query_terms_are_deduplicated_for_statistics(
 
     # Round one asks for df once per distinct term, even though scoring will
     # weigh the repeated term twice.
-    stats = run(coordinator._collect_corpus_stats(["search"]))
+    selection = run(coordinator._select_and_collect(["search"]))
+    frequencies = [stats.document_frequencies for _, stats in selection]
 
-    assert stats.document_frequencies == {"search": 1}
+    assert {"search": 1} in frequencies
 
 
 # ----------------------------------------------------------------------

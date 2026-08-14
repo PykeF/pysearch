@@ -186,3 +186,69 @@ async def ready(coordinator: CoordinatorDep, response: Response) -> ReadinessRes
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return ReadinessResponse(status="not_ready", detail=readiness.detail)
     return ReadinessResponse(status="ready", detail=readiness.detail)
+
+
+class CopyStatusResponse(BaseModel):
+    """One physical copy of a logical shard."""
+
+    role: str
+    reachable: bool
+    node_id: str
+    state: str
+    ready: bool
+    generation: int | None
+
+
+class ShardStatusResponse(BaseModel):
+    """What one logical shard can currently do."""
+
+    shard_id: int
+    search_available: bool
+    write_available: bool
+    copies: list[CopyStatusResponse]
+
+
+class ClusterStatusResponse(BaseModel):
+    """Cluster capability, shard by shard.
+
+    Search and write availability are reported separately because losing a
+    primary leaves its logical shard readable through a replica but not
+    writable: nothing is promoted automatically, by design.
+    """
+
+    shard_count: int
+    replication_factor: int
+    search_available: bool
+    write_available: bool
+    shards: list[ShardStatusResponse]
+
+
+@router.get("/cluster/status", summary="Report cluster topology and capability")
+async def cluster_status(coordinator: CoordinatorDep) -> ClusterStatusResponse:
+    """Report each logical shard's copies, and what the cluster can currently do."""
+    health = await coordinator.cluster_status()
+    return ClusterStatusResponse(
+        shard_count=health.shard_count,
+        replication_factor=health.replication_factor,
+        search_available=health.search_available,
+        write_available=health.write_available,
+        shards=[
+            ShardStatusResponse(
+                shard_id=shard.shard_id,
+                search_available=shard.search_available,
+                write_available=shard.write_available,
+                copies=[
+                    CopyStatusResponse(
+                        role=copy.role,
+                        reachable=copy.reachable,
+                        node_id=copy.node_id,
+                        state=copy.state,
+                        ready=copy.ready,
+                        generation=copy.generation,
+                    )
+                    for copy in shard.copies
+                ],
+            )
+            for shard in health.shards
+        ],
+    )

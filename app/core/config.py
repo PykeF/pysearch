@@ -14,6 +14,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 Environment = Literal["local", "test", "production"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 NodeRole = Literal["single", "shard", "coordinator"]
+ReplicaRole = Literal["primary", "replica"]
 
 
 class Settings(BaseSettings):
@@ -55,11 +56,29 @@ class Settings(BaseSettings):
     #: document.
     shard_count: int = Field(default=1, ge=1)
 
-    #: Shard base URLs as a comma-separated list, positionally indexed by shard
-    #: id, required when the role is ``coordinator``. Kept as a string because
-    #: pydantic-settings decodes structured fields as JSON, which would make an
-    #: ordinary comma-separated environment variable a parse error.
+    #: Primary base URLs as a comma-separated list, positionally indexed by
+    #: logical shard id, required when the role is ``coordinator``. Kept as a
+    #: string because pydantic-settings decodes structured fields as JSON, which
+    #: would make an ordinary comma-separated environment variable a parse error.
     shard_urls: str = ""
+
+    #: Replica base URLs: ``;`` separates logical shards, ``,`` separates the
+    #: replicas within one. Empty means replication factor 1, which is exactly
+    #: the single-copy topology of the previous phase.
+    replica_urls: str = ""
+
+    #: Whether this shard node is the writable copy or a replica of one.
+    replica_role: ReplicaRole | None = None
+
+    #: This node's base URL for its primary, required on a replica so it can
+    #: verify synchronization and resynchronize.
+    primary_url: str = ""
+
+    #: Stable name for this physical node, used in logs and cluster status.
+    node_id: str = ""
+
+    #: Bound on one primary-to-replica replication call.
+    replication_timeout: float = Field(default=2.0, gt=0.0)
 
     connect_timeout: float = Field(default=1.0, gt=0.0)
     request_timeout: float = Field(default=2.0, gt=0.0)
@@ -72,8 +91,34 @@ class Settings(BaseSettings):
 
     @property
     def shard_addresses(self) -> tuple[str, ...]:
-        """The configured shard URLs, indexed by shard id."""
+        """The configured primary URLs, indexed by logical shard id."""
         return tuple(url.strip() for url in self.shard_urls.split(",") if url.strip())
+
+    @property
+    def replica_addresses(self) -> tuple[tuple[str, ...], ...]:
+        """The configured replica URLs, grouped by logical shard id."""
+        if not self.replica_urls.strip():
+            return ()
+        return tuple(
+            tuple(url.strip() for url in group.split(",") if url.strip())
+            for group in self.replica_urls.split(";")
+        )
+
+    @property
+    def own_replica_addresses(self) -> tuple[str, ...]:
+        """The replicas this node must replicate to, on a shard primary.
+
+        A shard node belongs to exactly one logical shard, so it configures
+        exactly one group and reads it here.
+        """
+        groups = self.replica_addresses
+        return groups[0] if groups else ()
+
+    @property
+    def replication_factor(self) -> int:
+        """Physical copies per logical shard."""
+        groups = self.replica_addresses
+        return 1 + (len(groups[0]) if groups else 0)
 
     @model_validator(mode="after")
     def _check_topology(self) -> "Settings":
@@ -96,6 +141,22 @@ class Settings(BaseSettings):
                 )
             if len(set(addresses)) != len(addresses):
                 raise ValueError("shard_urls contains duplicate addresses")
+
+            groups = self.replica_addresses
+            if groups:
+                if len(groups) != self.shard_count:
+                    raise ValueError(
+                        f"shard_count is {self.shard_count} but {len(groups)} replica "
+                        f"groups were given"
+                    )
+                if len({len(group) for group in groups}) != 1:
+                    raise ValueError("every logical shard must have the same replica count")
+                everything = [*addresses, *(url for group in groups for url in group)]
+                if len(set(everything)) != len(everything):
+                    # Two entries pointing at one process would mean a "replica"
+                    # that is really the primary, so a node failure would take
+                    # both copies with it.
+                    raise ValueError("shard_urls and replica_urls overlap or repeat")
 
         return self
 

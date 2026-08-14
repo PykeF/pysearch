@@ -16,11 +16,16 @@ from fastapi.testclient import TestClient
 
 from app.cluster.client import HttpShardClient, ShardClient
 from app.cluster.errors import ShardTimeoutError, ShardUnavailableError
+from app.cluster.topology import build_topology
 from app.core.config import Settings
 from app.main import create_app
 from app.search.document import Document
 from app.search.index import CorpusStats
-from tests.conftest import CLUSTER_SHARD_COUNT, make_coordinator_settings, make_shard_settings
+from tests.conftest import (
+    CLUSTER_SHARD_COUNT,
+    make_coordinator_settings,
+    make_shard_settings,
+)
 
 
 class BrokenShardClient:
@@ -47,6 +52,9 @@ class BrokenShardClient:
     async def is_ready(self) -> bool:
         return False
 
+    async def node_status(self) -> object:
+        raise self._error
+
 
 def cluster_with_broken_shard(
     stack: ExitStack, directory: Path, broken_shard: int, error: Exception
@@ -70,7 +78,9 @@ def cluster_with_broken_shard(
             )
         )
 
-    coordinator = TestClient(create_app(make_coordinator_settings(), shard_clients=clients))
+    coordinator = TestClient(
+        create_app(make_coordinator_settings(), topology=build_topology(clients, []))
+    )
     stack.enter_context(coordinator)
     return coordinator
 
@@ -197,7 +207,9 @@ def test_a_degraded_shard_is_treated_as_unavailable(
             if shard_id == 2:
                 degraded_app = shard_app
 
-        coordinator = TestClient(create_app(make_coordinator_settings(), shard_clients=clients))
+        coordinator = TestClient(
+            create_app(make_coordinator_settings(), topology=build_topology(clients, []))
+        )
         stack.enter_context(coordinator)
 
         # Break shard 2's derived state so its next write degrades it.

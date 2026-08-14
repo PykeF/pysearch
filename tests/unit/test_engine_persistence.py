@@ -1,6 +1,6 @@
 """Tests for the engine's durability contract: write ordering, failure, degradation."""
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 
 import pytest
 
@@ -16,26 +16,37 @@ class RecordingStore:
 
     def __init__(self) -> None:
         self._documents: dict[str, Document] = {}
+        self._generation = 0
         self.calls: list[str] = []
         self.fail_on_put = False
         self.fail_on_delete = False
 
-    def put(self, document: Document) -> bool:
+    def put(self, document: Document, generation: int) -> bool:
         self.calls.append("put")
         if self.fail_on_put:
             raise StorageError("storage is unavailable")
         created = document.document_id not in self._documents
         self._documents[document.document_id] = document
+        self._generation = generation
         return created
 
     def get(self, document_id: str) -> Document | None:
         return self._documents.get(document_id)
 
-    def delete(self, document_id: str) -> bool:
+    def delete(self, document_id: str, generation: int) -> bool:
         self.calls.append("delete")
         if self.fail_on_delete:
             raise StorageError("storage is unavailable")
-        return self._documents.pop(document_id, None) is not None
+        existed = self._documents.pop(document_id, None) is not None
+        self._generation = generation
+        return existed
+
+    def replace_all(self, documents: Iterable[Document], generation: int) -> None:
+        self._documents = {document.document_id: document for document in documents}
+        self._generation = generation
+
+    def generation(self) -> int:
+        return self._generation
 
     def iter_documents(self) -> Iterator[Document]:
         for document_id in sorted(self._documents):
@@ -80,8 +91,8 @@ def test_an_uninitialized_engine_refuses_every_request(store: RecordingStore) ->
 
 
 def test_initialize_reports_what_it_rebuilt(store: RecordingStore) -> None:
-    store.put(Document(document_id="doc-1", text="distributed search"))
-    store.put(Document(document_id="doc-2", text="ranking"))
+    store.put(Document(document_id="doc-1", text="distributed search"), generation=1)
+    store.put(Document(document_id="doc-2", text="ranking"), generation=2)
 
     report = SearchEngine(store).initialize()
 
@@ -90,7 +101,7 @@ def test_initialize_reports_what_it_rebuilt(store: RecordingStore) -> None:
 
 
 def test_initialize_rebuilds_derived_state_from_storage(store: RecordingStore) -> None:
-    store.put(Document(document_id="doc-1", text="distributed search"))
+    store.put(Document(document_id="doc-1", text="distributed search"), generation=1)
 
     engine = SearchEngine(store)
     engine.initialize()
@@ -296,7 +307,7 @@ def test_validate_detects_a_cache_that_disagrees_with_storage(
 ) -> None:
     persistent_engine.index_document(Document(document_id="doc-1", text="search"))
     # Mutate storage behind the engine's back.
-    store.put(Document(document_id="doc-1", text="something else entirely"))
+    store.put(Document(document_id="doc-1", text="something else entirely"), generation=1)
 
     with pytest.raises(IndexInvariantError, match="differs from storage"):
         persistent_engine.validate()
@@ -305,7 +316,7 @@ def test_validate_detects_a_cache_that_disagrees_with_storage(
 def test_validate_detects_a_document_missing_from_the_cache(
     persistent_engine: SearchEngine, store: RecordingStore
 ) -> None:
-    store.put(Document(document_id="ghost", text="never indexed"))
+    store.put(Document(document_id="ghost", text="never indexed"), generation=0)
 
     with pytest.raises(IndexInvariantError, match="storage holds"):
         persistent_engine.validate()

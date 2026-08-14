@@ -11,7 +11,7 @@ way to prevent that mistake is not to offer the path.
 """
 
 import logging
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
 import httpx2
@@ -25,10 +25,17 @@ from app.api.health import router as health_router
 from app.api.index import router as index_router
 from app.api.internal import router as internal_router
 from app.api.search import router as search_router
-from app.cluster.client import HttpShardClient, ShardClient
+from app.cluster.client import HttpShardClient
 from app.cluster.coordinator import Coordinator
 from app.cluster.errors import ClusterError
+from app.cluster.replication import (
+    HttpNodeLink,
+    NodeLink,
+    ReplicaSynchronizer,
+    Replicator,
+)
 from app.cluster.routing import ShardRouter
+from app.cluster.topology import ClusterTopology, build_topology
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
 from app.search.engine import SearchEngine
@@ -96,18 +103,23 @@ def _register_error_handlers(app: FastAPI) -> None:
 
 
 def _node_lifespan(
-    settings: Settings,
+    settings: Settings, node_links: Callable[[str], NodeLink] | None
 ) -> Callable[[FastAPI], AbstractAsyncContextManager[None]]:
     """Build the startup/shutdown hook for a node that owns documents.
 
-    Recovery happens here rather than lazily on first use, so the application
-    cannot serve a request against a half-built index. A failure to open storage
-    or rebuild aborts startup instead of serving a broken service.
+    Local recovery happens here rather than lazily on first use, so the
+    application cannot serve a request against a half-built index. A failure to
+    open storage or rebuild aborts startup instead of serving a broken service.
+
+    A replica goes further: local recovery proves only that it read its own
+    database, not that it holds everything its primary accepted while it was
+    away. So it verifies its generation against the primary and, if it cannot,
+    stays **not ready**. Refusing to serve is the safe answer; a replica that
+    claimed readiness without evidence could quietly answer searches from an
+    incomplete corpus.
 
     The engine's lifecycle methods are synchronous and know nothing about
-    FastAPI; this hook only orchestrates them. They block the event loop while
-    they run, which is what we want during startup — there is nothing else to
-    serve yet.
+    FastAPI; this hook only orchestrates them.
     """
 
     @asynccontextmanager
@@ -122,20 +134,67 @@ def _node_lifespan(
             extra={
                 "storage_path": str(settings.storage_path),
                 "documents": report.document_count,
+                "generation": engine.generation,
                 "duration_ms": round(report.duration_seconds * 1000, 3),
             },
         )
+
+        peers: httpx2.Client | None = None
+        if settings.node_role == "shard":
+            make_link = node_links
+            if make_link is None:
+                peers = httpx2.Client(
+                    timeout=httpx2.Timeout(
+                        settings.replication_timeout, connect=settings.connect_timeout
+                    )
+                )
+                client = peers
+
+                def make_link(url: str) -> NodeLink:
+                    return HttpNodeLink(url, client)
+
+            _attach_replication_role(app, settings, engine, make_link)
+
         try:
             yield
         finally:
+            if peers is not None:
+                peers.close()
             engine.close()
             logger.info("storage closed")
 
     return lifespan
 
 
+def _attach_replication_role(
+    app: FastAPI,
+    settings: Settings,
+    engine: SearchEngine,
+    make_link: Callable[[str], NodeLink],
+) -> None:
+    """Give a shard node the half of the replication protocol its role plays."""
+    if settings.replica_role == "primary":
+        targets = [make_link(url) for url in settings.own_replica_addresses]
+        app.state.replicator = Replicator(engine, targets)
+        logger.info("primary ready", extra={"replicas": len(targets)})
+        return
+
+    synchronizer = ReplicaSynchronizer(engine, make_link(settings.primary_url))
+    app.state.synchronizer = synchronizer
+    outcome = synchronizer.synchronize()
+    logger.info(
+        "replica synchronization checked",
+        extra={
+            "synchronized": outcome.synchronized,
+            "detail": outcome.detail,
+            "local_generation": outcome.local_generation,
+            "primary_generation": outcome.primary_generation,
+        },
+    )
+
+
 def _coordinator_lifespan(
-    settings: Settings, shard_clients: Sequence[ShardClient] | None
+    settings: Settings, topology: ClusterTopology | None
 ) -> Callable[[FastAPI], AbstractAsyncContextManager[None]]:
     """Build the startup/shutdown hook for a coordinator.
 
@@ -147,18 +206,29 @@ def _coordinator_lifespan(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         http: httpx2.AsyncClient | None = None
-        clients = shard_clients
+        cluster = topology
 
-        if clients is None:
+        if cluster is None:
             http = httpx2.AsyncClient(
                 timeout=httpx2.Timeout(settings.request_timeout, connect=settings.connect_timeout)
             )
-            clients = [HttpShardClient(url, http) for url in settings.shard_addresses]
+            cluster = build_topology(
+                primaries=[HttpShardClient(url, http) for url in settings.shard_addresses],
+                replicas=[
+                    [HttpShardClient(url, http) for url in group]
+                    for group in settings.replica_addresses
+                ],
+            )
 
-        app.state.coordinator = Coordinator(ShardRouter(settings.shard_count), clients)
+        app.state.coordinator = Coordinator(ShardRouter(settings.shard_count), cluster)
         logger.info(
             "coordinator ready",
-            extra={"shard_count": settings.shard_count, "shards": list(settings.shard_addresses)},
+            extra={
+                "shard_count": settings.shard_count,
+                "replication_factor": cluster.replication_factor,
+                "primaries": list(settings.shard_addresses),
+                "replicas": [list(group) for group in settings.replica_addresses],
+            },
         )
         try:
             yield
@@ -172,7 +242,8 @@ def _coordinator_lifespan(
 
 def create_app(
     settings: Settings | None = None,
-    shard_clients: Sequence[ShardClient] | None = None,
+    topology: ClusterTopology | None = None,
+    node_links: Callable[[str], NodeLink] | None = None,
 ) -> FastAPI:
     """Build a configured FastAPI application for this node's role.
 
@@ -180,27 +251,31 @@ def create_app(
     can build an isolated application without touching process-wide state. When
     omitted, the cached process settings are used.
 
-    ``shard_clients`` overrides the coordinator's transport, which is what lets
-    distributed tests wire a coordinator to in-process shard applications
-    instead of sockets. It is the same kind of injection as ``settings``, and it
-    is ignored by every role but ``coordinator``.
+    ``topology`` and ``node_links`` override the transports — coordinator to
+    node, and node to node respectively — which is what lets distributed tests
+    wire a whole replicated cluster of in-process applications together instead
+    of sockets. They are the same kind of injection as ``settings``.
     """
     settings = settings or get_settings()
 
     context: dict[str, object] = {"node_role": settings.node_role}
     if settings.shard_id is not None:
         context["shard_id"] = settings.shard_id
+    if settings.replica_role is not None:
+        context["replica_role"] = settings.replica_role
+    if settings.node_id:
+        context["node_id"] = settings.node_id
     configure_logging(settings.log_level, context)
 
     if settings.node_role == "coordinator":
         app = FastAPI(
             title=settings.app_name,
-            lifespan=_coordinator_lifespan(settings, shard_clients),
+            lifespan=_coordinator_lifespan(settings, topology),
         )
         app.include_router(health_router)
         app.include_router(cluster_router)
     else:
-        app = FastAPI(title=settings.app_name, lifespan=_node_lifespan(settings))
+        app = FastAPI(title=settings.app_name, lifespan=_node_lifespan(settings, node_links))
         app.include_router(health_router)
         app.include_router(readiness_router)
         if settings.node_role == "shard":
@@ -210,6 +285,7 @@ def create_app(
             app.include_router(search_router)
             app.include_router(index_router)
 
+    app.state.settings = settings
     _register_error_handlers(app)
 
     logger.info(

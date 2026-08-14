@@ -1,14 +1,15 @@
-# A three-shard cluster plus a coordinator, for reproducible local development.
+# A three-shard cluster with a replica per shard, plus a coordinator, for
+# reproducible local development.
 #
 # Compose is a deployment mechanism here, not the distributed system: routing,
-# fan-out, merging and the failure policy are all plain Python and are exercised
-# by the test suite and by scripts/run_cluster.py without containers.
+# replication, failover, fan-out and merging are all plain Python and are
+# exercised by the test suite and by scripts/run_cluster.py without containers.
 #
 #   docker compose up --build
-#   curl localhost:8000/ready
+#   curl localhost:8000/cluster/status
 #
-# Each shard gets its own volume. Two shards pointed at one database would share
-# a corpus instead of partitioning it, which is the opposite of sharding.
+# Every physical node gets its own volume. A primary and its replica pointed at
+# one database would be two views of a single copy, which is not replication.
 
 x-node: &node
   build: .
@@ -19,51 +20,115 @@ x-node: &node
     PYSEARCH_STORAGE_PATH: /data/pysearch.db
   restart: unless-stopped
 
+x-healthcheck: &healthcheck
+  # No curl in the slim image, and adding one just for a probe is not worth the
+  # surface; the interpreter is already here.
+  test:
+    [
+      "CMD",
+      "python",
+      "-c",
+      "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/ready').status==200 else 1)",
+    ]
+  interval: 5s
+  timeout: 3s
+  retries: 10
+  start_period: 5s
+
 services:
-  shard-0:
+  shard-0-primary:
     <<: *node
     environment:
       <<: *node-env
-      PYSEARCH_APP_NAME: pysearch-shard-0
+      PYSEARCH_APP_NAME: pysearch-shard-0-primary
+      PYSEARCH_NODE_ID: shard-0-primary
       PYSEARCH_NODE_ROLE: shard
       PYSEARCH_SHARD_ID: "0"
+      PYSEARCH_REPLICA_ROLE: primary
+      PYSEARCH_REPLICA_URLS: http://shard-0-replica:8000
     volumes:
-      - shard-0-data:/data
-    healthcheck: &healthcheck
-      # No curl in the slim image, and adding one just for a probe is not worth
-      # the surface; the interpreter is already here.
-      test:
-        [
-          "CMD",
-          "python",
-          "-c",
-          "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/ready').status==200 else 1)",
-        ]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-      start_period: 5s
-
-  shard-1:
-    <<: *node
-    environment:
-      <<: *node-env
-      PYSEARCH_APP_NAME: pysearch-shard-1
-      PYSEARCH_NODE_ROLE: shard
-      PYSEARCH_SHARD_ID: "1"
-    volumes:
-      - shard-1-data:/data
+      - shard-0-primary-data:/data
     healthcheck: *healthcheck
 
-  shard-2:
+  shard-0-replica:
     <<: *node
     environment:
       <<: *node-env
-      PYSEARCH_APP_NAME: pysearch-shard-2
+      PYSEARCH_APP_NAME: pysearch-shard-0-replica
+      PYSEARCH_NODE_ID: shard-0-replica
+      PYSEARCH_NODE_ROLE: shard
+      PYSEARCH_SHARD_ID: "0"
+      PYSEARCH_REPLICA_ROLE: replica
+      PYSEARCH_PRIMARY_URL: http://shard-0-primary:8000
+    volumes:
+      - shard-0-replica-data:/data
+    # A replica verifies itself against its primary during startup, so it must
+    # be able to reach it or it will correctly refuse to serve.
+    depends_on:
+      shard-0-primary:
+        condition: service_healthy
+    healthcheck: *healthcheck
+
+  shard-1-primary:
+    <<: *node
+    environment:
+      <<: *node-env
+      PYSEARCH_APP_NAME: pysearch-shard-1-primary
+      PYSEARCH_NODE_ID: shard-1-primary
+      PYSEARCH_NODE_ROLE: shard
+      PYSEARCH_SHARD_ID: "1"
+      PYSEARCH_REPLICA_ROLE: primary
+      PYSEARCH_REPLICA_URLS: http://shard-1-replica:8000
+    volumes:
+      - shard-1-primary-data:/data
+    healthcheck: *healthcheck
+
+  shard-1-replica:
+    <<: *node
+    environment:
+      <<: *node-env
+      PYSEARCH_APP_NAME: pysearch-shard-1-replica
+      PYSEARCH_NODE_ID: shard-1-replica
+      PYSEARCH_NODE_ROLE: shard
+      PYSEARCH_SHARD_ID: "1"
+      PYSEARCH_REPLICA_ROLE: replica
+      PYSEARCH_PRIMARY_URL: http://shard-1-primary:8000
+    volumes:
+      - shard-1-replica-data:/data
+    depends_on:
+      shard-1-primary:
+        condition: service_healthy
+    healthcheck: *healthcheck
+
+  shard-2-primary:
+    <<: *node
+    environment:
+      <<: *node-env
+      PYSEARCH_APP_NAME: pysearch-shard-2-primary
+      PYSEARCH_NODE_ID: shard-2-primary
       PYSEARCH_NODE_ROLE: shard
       PYSEARCH_SHARD_ID: "2"
+      PYSEARCH_REPLICA_ROLE: primary
+      PYSEARCH_REPLICA_URLS: http://shard-2-replica:8000
     volumes:
-      - shard-2-data:/data
+      - shard-2-primary-data:/data
+    healthcheck: *healthcheck
+
+  shard-2-replica:
+    <<: *node
+    environment:
+      <<: *node-env
+      PYSEARCH_APP_NAME: pysearch-shard-2-replica
+      PYSEARCH_NODE_ID: shard-2-replica
+      PYSEARCH_NODE_ROLE: shard
+      PYSEARCH_SHARD_ID: "2"
+      PYSEARCH_REPLICA_ROLE: replica
+      PYSEARCH_PRIMARY_URL: http://shard-2-primary:8000
+    volumes:
+      - shard-2-replica-data:/data
+    depends_on:
+      shard-2-primary:
+        condition: service_healthy
     healthcheck: *healthcheck
 
   coordinator:
@@ -72,22 +137,26 @@ services:
       <<: *node-env
       PYSEARCH_APP_NAME: pysearch-coordinator
       PYSEARCH_NODE_ROLE: coordinator
-      PYSEARCH_SHARD_URLS: http://shard-0:8000,http://shard-1:8000,http://shard-2:8000
+      PYSEARCH_SHARD_URLS: http://shard-0-primary:8000,http://shard-1-primary:8000,http://shard-2-primary:8000
+      PYSEARCH_REPLICA_URLS: http://shard-0-replica:8000;http://shard-1-replica:8000;http://shard-2-replica:8000
       PYSEARCH_REQUEST_TIMEOUT: "2.0"
       PYSEARCH_CONNECT_TIMEOUT: "1.0"
     ports:
       - "8000:8000"
     depends_on:
-      shard-0:
+      shard-0-replica:
         condition: service_healthy
-      shard-1:
+      shard-1-replica:
         condition: service_healthy
-      shard-2:
+      shard-2-replica:
         condition: service_healthy
 
 # The coordinator has no volume: it owns no documents, which is why losing it
 # loses nothing.
 volumes:
-  shard-0-data:
-  shard-1-data:
-  shard-2-data:
+  shard-0-primary-data:
+  shard-0-replica-data:
+  shard-1-primary-data:
+  shard-1-replica-data:
+  shard-2-primary-data:
+  shard-2-replica-data:

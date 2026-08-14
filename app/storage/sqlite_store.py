@@ -39,18 +39,30 @@ the database's.
 """
 
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 
 from app.search.document import Document
 from app.storage.errors import StorageError, StorageInitializationError
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS documents (
-    document_id TEXT PRIMARY KEY,
-    text TEXT NOT NULL
+_SCHEMA = (
+    """
+    CREATE TABLE IF NOT EXISTS documents (
+        document_id TEXT PRIMARY KEY,
+        text TEXT NOT NULL
+    )
+    """,
+    # One row, holding the mutation sequence number this copy has applied up to.
+    # It lives in the same database as the documents so that a mutation and the
+    # generation it advances to commit or roll back together.
+    """
+    CREATE TABLE IF NOT EXISTS shard_metadata (
+        id INTEGER PRIMARY KEY CHECK (id = 0),
+        generation INTEGER NOT NULL
+    )
+    """,
+    "INSERT OR IGNORE INTO shard_metadata (id, generation) VALUES (0, 0)",
 )
-"""
 
 _SCHEMA_VERSION = 1
 
@@ -83,7 +95,8 @@ class SqliteDocumentStore:
 
             connection = sqlite3.connect(location, check_same_thread=False)
             connection.execute("PRAGMA synchronous = FULL")
-            connection.execute(_SCHEMA)
+            for statement in _SCHEMA:
+                connection.execute(statement)
             connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
             connection.commit()
         except (sqlite3.Error, OSError) as error:
@@ -91,8 +104,8 @@ class SqliteDocumentStore:
 
         return cls(connection)
 
-    def put(self, document: Document) -> bool:
-        """Store a document, replacing any document with the same id."""
+    def put(self, document: Document, generation: int) -> bool:
+        """Store a document and advance the generation, in one transaction."""
         try:
             with self._connection:
                 existing = self._connection.execute(
@@ -103,6 +116,7 @@ class SqliteDocumentStore:
                     "INSERT OR REPLACE INTO documents (document_id, text) VALUES (?, ?)",
                     (document.document_id, document.text),
                 )
+                self._set_generation(generation)
         except sqlite3.Error as error:
             raise StorageError("failed to store document") from error
 
@@ -122,18 +136,50 @@ class SqliteDocumentStore:
             return None
         return Document(document_id=row[0], text=row[1])
 
-    def delete(self, document_id: str) -> bool:
-        """Remove a document, reporting whether one existed."""
+    def delete(self, document_id: str, generation: int) -> bool:
+        """Remove a document and advance the generation, in one transaction."""
         try:
             with self._connection:
                 cursor = self._connection.execute(
                     "DELETE FROM documents WHERE document_id = ?",
                     (document_id,),
                 )
+                self._set_generation(generation)
         except sqlite3.Error as error:
             raise StorageError("failed to delete document") from error
 
         return cursor.rowcount > 0
+
+    def replace_all(self, documents: Iterable[Document], generation: int) -> None:
+        """Replace the whole corpus and set the generation, in one transaction."""
+        try:
+            with self._connection:
+                self._connection.execute("DELETE FROM documents")
+                self._connection.executemany(
+                    "INSERT INTO documents (document_id, text) VALUES (?, ?)",
+                    [(document.document_id, document.text) for document in documents],
+                )
+                self._set_generation(generation)
+        except sqlite3.Error as error:
+            raise StorageError("failed to replace the corpus") from error
+
+    def generation(self) -> int:
+        """Return the mutation sequence number this copy has applied up to."""
+        try:
+            row = self._connection.execute(
+                "SELECT generation FROM shard_metadata WHERE id = 0"
+            ).fetchone()
+        except sqlite3.Error as error:
+            raise StorageError("failed to read the generation") from error
+
+        generation: int = row[0]
+        return generation
+
+    def _set_generation(self, generation: int) -> None:
+        """Write the generation. Caller is inside a transaction."""
+        self._connection.execute(
+            "UPDATE shard_metadata SET generation = ? WHERE id = 0", (generation,)
+        )
 
     def iter_documents(self) -> Iterator[Document]:
         """Yield every stored document, ordered by id so rebuilds are reproducible."""

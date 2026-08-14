@@ -32,3 +32,21 @@ class DistributedSearchError(ClusterError):
     def __init__(self, message: str, shard_ids: tuple[int, ...]) -> None:
         super().__init__(message)
         self.shard_ids = shard_ids
+
+
+class ReplicationError(ClusterError):
+    """A replica failed to apply a mutation the primary had already committed.
+
+    The write is durable on the primary and is deliberately not rolled back —
+    storage is authoritative and a compensating delete could fail too. It is
+    simply not acknowledged, so the client is told the write failed even though
+    it may be present on the primary.
+    """
+
+
+class ShardCopiesExhaustedError(ClusterError):
+    """Every copy of a logical shard failed, so the corpus is incomplete."""
+
+    def __init__(self, message: str, shard_id: int) -> None:
+        super().__init__(message)
+        self.shard_id = shard_id

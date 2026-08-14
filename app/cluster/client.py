@@ -10,6 +10,7 @@ endpoint.
 """
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Protocol
 
 import httpx2
@@ -21,8 +22,20 @@ from app.search.errors import DocumentNotFoundError
 from app.search.index import CorpusStats, IndexStats
 
 
+@dataclass(frozen=True, slots=True)
+class NodeStatus:
+    """One physical node's identity and serving state."""
+
+    node_id: str
+    shard_id: int
+    replica_role: str
+    state: str
+    ready: bool
+    generation: int
+
+
 class ShardClient(Protocol):
-    """One shard, as the coordinator sees it."""
+    """One physical copy of a logical shard, as the coordinator sees it."""
 
     async def put_document(self, document: Document) -> bool:
         """Store a document on this shard, returning ``True`` if it is new."""
@@ -50,6 +63,10 @@ class ShardClient(Protocol):
 
     async def is_ready(self) -> bool:
         """Return whether this shard reports itself ready to serve."""
+        ...
+
+    async def node_status(self) -> "NodeStatus":
+        """Return this node's role, serving state and generation."""
         ...
 
 
@@ -136,6 +153,18 @@ class HttpShardClient:
             # cannot be reached is simply not ready.
             return False
         return response.status_code == httpx2.codes.OK
+
+    async def node_status(self) -> NodeStatus:
+        response = await self._request("GET", "/internal/node-status")
+        payload = response.json()
+        return NodeStatus(
+            node_id=payload["node_id"],
+            shard_id=payload["shard_id"],
+            replica_role=payload["replica_role"],
+            state=payload["state"],
+            ready=payload["ready"],
+            generation=payload["generation"],
+        )
 
     async def _request(
         self,
