@@ -1,4 +1,11 @@
-"""Liveness and readiness endpoints."""
+"""Liveness and readiness endpoints.
+
+Liveness is universal — every role has a process that is either running or not.
+Readiness is role-specific: a node that owns documents is ready when its index
+has been rebuilt, whereas a coordinator's readiness is a property of the whole
+cluster. The two routers are separate so each role wires up the one that can
+actually answer the question.
+"""
 
 from typing import Literal
 
@@ -8,6 +15,7 @@ from pydantic import BaseModel, Field
 from app.api.dependencies import EngineDep
 
 router = APIRouter(tags=["health"])
+readiness_router = APIRouter(tags=["health"])
 
 
 class HealthResponse(BaseModel):
@@ -35,7 +43,7 @@ def health() -> HealthResponse:
     return HealthResponse()
 
 
-@router.get(
+@readiness_router.get(
     "/ready",
     summary="Report whether the service can serve requests",
     responses={

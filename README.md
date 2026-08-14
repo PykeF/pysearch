@@ -2,13 +2,14 @@
 
 An educational distributed search engine, written from scratch in Python.
 
-> **Current status: Phase 2 — storage and index persistence.**
-> PySearch is a working single-node lexical search engine with a durable
-> corpus: it analyses text, stores documents in SQLite, builds an inverted
-> index in memory, and ranks results with BM25 over an HTTP API. Documents
-> survive restarts; the index is rebuilt from them at startup. There is no
-> second node and no semantic search — those are the roadmap below, not
-> features of this code.
+> **Current status: Phase 3 — distributed search.**
+> PySearch is a working distributed lexical search engine. Documents are
+> partitioned across shard nodes by a stable hash, each shard owns its own
+> durable SQLite corpus and its own in-memory index, and a coordinator fans
+> queries out in parallel and merges a global top-k. Distributed ranking is
+> equivalent to a single node holding the whole corpus. There is **no
+> replication and no failover** — losing a shard fails queries — and no
+> semantic search. Those are the roadmap below, not features of this code.
 
 ## Motivation
 
@@ -25,25 +26,51 @@ effort stays on the parts worth understanding.
 
 ## What exists today
 
-**Implemented (Phases 0–2)**
+**Implemented (Phases 0–3)**
 
 - Unicode-aware text normalization and tokenization, shared by documents and queries
 - An in-memory inverted index with posting lists and term frequencies
 - Incrementally maintained corpus statistics (`N`, `df`, `tf`, `dl`, `avgdl`)
 - BM25 ranking with deterministic ordering and tie-breaking
 - Indexing, replacement and deletion of documents, with statistics kept correct
-- **A durable document corpus in SQLite, with transactional writes**
-- **Startup recovery: the index and document cache are rebuilt from storage**
-- **Liveness and readiness endpoints, with an explicit degraded state**
+- A durable document corpus in SQLite, with transactional writes
+- Startup recovery: the index and document cache are rebuilt from storage
+- Liveness and readiness endpoints, with an explicit degraded state
+- **Deterministic sharding across multiple nodes, with a coordinator**
+- **Parallel query fan-out and a deterministic global top-k merge**
+- **Cluster-wide BM25 statistics, so distributed ranking matches single-node**
+- **Docker Compose topology for reproducible multi-node local deployment**
 - HTTP APIs for indexing, deletion, search and index statistics
-- Structured JSON logging, environment-driven configuration
-- 184 tests, strict type checking, linting and formatting gates
+- Structured JSON logging carrying node role and shard id
+- 283 tests, strict type checking, linting and formatting gates
 
-**Not implemented** — index snapshots, replication, multiple nodes, sharding,
-query caching, phrase or fuzzy search, stemming, embeddings, vector search,
-hybrid retrieval, authentication. See the roadmap.
+**Not implemented** — replication, failover, leader election, consensus,
+dynamic membership, rebalancing, index snapshots, query caching, phrase or
+fuzzy search, stemming, embeddings, vector search, hybrid retrieval,
+authentication. See the roadmap.
 
 ## Architecture
+
+A cluster is a coordinator plus a fixed number of shard nodes:
+
+```text
+                            Client
+                              |
+                      +-------v--------+
+                      |  Coordinator   |   routes, fans out, merges
+                      +---+----+-----+-+   owns no documents
+                          |    |     |
+              +-----------+    |     +-----------+
+              v                v                 v
+          +--------+       +--------+        +--------+
+          | Shard 0|       | Shard 1|        | Shard 2|
+          +---+----+       +---+----+        +---+----+
+              |                |                 |
+          shard-0.db       shard-1.db        shard-2.db
+```
+
+Each shard is a complete Phase 2 node — its own durable corpus, its own document
+cache, its own inverted index — and reuses that code unchanged:
 
 ```text
                       +----------------+
@@ -320,6 +347,138 @@ indexing, because indexing pays one fsync per document while recovery is a singl
 sequential read. Snapshots would only become worth their consistency cost once
 this column stops being acceptable.
 
+## Distributed search
+
+### Roles
+
+| Role | Serves | Owns |
+| --- | --- | --- |
+| `single` (default) | the full public API | its own corpus |
+| `shard` | `/internal/*`, `/health`, `/ready` | its slice of the corpus |
+| `coordinator` | the full public API | nothing but the topology |
+
+A shard deliberately exposes **no public `/search`**. Querying one shard directly
+would return silently partial results scored against only that shard's
+statistics, and the cheapest way to prevent that mistake is not to offer the
+path. `single` is the default, so running one node requires knowing none of this.
+
+### Routing
+
+```text
+shard_id = int(blake2b(document_id, digest_size=8), "big") % shard_count
+```
+
+`hash()` cannot be used: Python randomises string hashing per process, so a
+document would route differently after a restart and differently again on
+another node. BLAKE2b is standard-library, fast, and depends on nothing but the
+input bytes; the encoding, digest size and byte order are all fixed because each
+would change the answer if left to a default. Pinned vectors for three shards:
+
+| `document_id` | shard |
+| --- | --- |
+| `doc-1` | 1 |
+| `doc-2` | 2 |
+| `doc-12` | 0 |
+| `""` | 0 |
+
+**Modulo, not consistent hashing.** Modulo is easy to reason about and easy to
+verify. The price is that `shard_count` is fixed for the life of a cluster:
+changing it moves nearly every document. That limitation is the motivation for
+rebalancing work later, not something Phase 3 pre-solves.
+
+Writes go to exactly one shard, are never broadcast, and are **never rerouted on
+failure** — rerouting would break the ownership routing depends on.
+
+### Distributed BM25
+
+Scores from different shards are comparable only if they were computed from the
+same corpus statistics. A term that is rare across the cluster but common on one
+shard would otherwise get a different `idf` there, and merging those numbers
+would compare quantities measured on different scales.
+
+So a search takes two rounds, both parallel fan-outs:
+
+```text
+round 1   ask every shard for N, summed length, and df of the query's terms
+          -> N = sum N_s,  total = sum len_s,  df(t) = sum df_s(t)
+round 2   ask every shard for its local top-k, scored with those statistics
+          -> merge candidates, sort, truncate
+```
+
+The sums are **exact, not estimates**, because every document lives on exactly
+one shard — a property replication would break.
+
+The coordinator analyses the query with the same `analyze()` the engine uses.
+The full token sequence drives scoring, where a repeated term is meant to count
+twice; the distinct terms drive the statistics request, where `df` is a property
+of the term alone.
+
+**The result:** distributed ranking is equivalent to a single node holding the
+whole corpus — same ordering, same tie-breaking, same scores up to ordinary
+floating-point behaviour. This is asserted by tests and was confirmed live
+against a running single-node process.
+
+### Global top-k
+
+Each shard returns only its local top-`k`, which is sufficient for an exact
+global top-`k` once scores are comparable: if a document is in the global top-k,
+fewer than `k` documents outrank it anywhere, so fewer than `k` outrank it on its
+own shard, so it is in that shard's local top-k and cannot be lost. The
+coordinator merges all `S·k` candidates by score descending, then `document_id`
+ascending — the single-node rule — so shard response order never influences the
+result.
+
+### Concurrency and the coordinator lock
+
+Fan-out is `asyncio.gather` over one pooled HTTP client, so all shard requests
+are in flight together and a search costs the **slowest** shard, not the sum.
+
+One lock is held across both rounds of a search and across every routed
+mutation. Without it a write could commit between the statistics round and the
+scoring round, leaving the statistics describing one corpus and the scored
+documents another. Phase 3 solves that conservatively — no distributed
+snapshots, versions, epochs or transactions.
+
+**The cost is real and deliberate: coordinator operations serialise.** One
+search at a time, and no write while a search is in flight. Correctness first.
+
+The guarantee covers mutations entering through the coordinator. The shards'
+`/internal` endpoints are an implementation interface, **not a supported
+external write path**; writing to them directly steps around this lock.
+
+### Failure policy
+
+**Any shard failure fails the whole query, with 503.** Two reasons: under
+cluster-wide statistics a missing shard corrupts `N`, `avgdl` and `df`, so
+partial results would be both incomplete *and* mis-scored; and without
+replication there is nothing that could recover the missing documents anyway.
+Nothing incomplete is ever returned as though it were complete.
+
+| Situation | Response |
+| --- | --- |
+| Any shard unreachable or slow during search | `503`, naming the failing shards |
+| Write or delete whose owning shard is down | `503`; never rerouted |
+| Write to a healthy shard while another is down | succeeds normally |
+| Any shard unready | `/ready` `503`; `/health` still `200` |
+
+Readiness requires **every** shard, which is the only setting consistent with
+the fail-whole policy: a cluster missing a shard cannot answer the queries it
+advertises.
+
+Every inter-node request is bounded by `PYSEARCH_CONNECT_TIMEOUT` and
+`PYSEARCH_REQUEST_TIMEOUT`, so an unresponsive shard can never hang a query.
+
+### Cluster statistics
+
+`document_count` sums. `average_document_length` is **weighted** —
+`Σ tokens / Σ documents`, never a mean of shard means, which would be wrong
+whenever shards hold different numbers of documents.
+
+There is **no cluster-wide `unique_term_count`**: vocabulary sizes cannot be
+summed, because the same term legitimately appears on several shards, and the
+true union would mean transferring every shard's vocabulary. Reporting a sum
+would be arithmetically false, so per-shard figures are given instead.
+
 ## API
 
 ### Index or replace a document
@@ -407,6 +566,10 @@ Let `T` be the tokens in a document, `U` its unique terms, `V` the vocabulary,
 | Query | O(Σ P(q) + M log M) | only the query terms' posting lists are visited; `M` matching documents are then sorted |
 | Corpus statistics | O(1) | maintained incrementally, never recomputed |
 | Startup recovery | O(total tokens) | every document is re-analysed and re-indexed from storage |
+| Routing | O(len(document_id)) | one BLAKE2b digest and a modulo |
+| Distributed write | one network round trip + the local work above | routed to a single owning shard |
+| Distributed search | 2 parallel fan-outs; latency ≈ the slowest shard | rounds are sequential, shards within a round are not |
+| Global merge | O(S·k log(S·k)) | `S` shards each returning `k` candidates |
 
 The query cost is the whole point of an inverted index: it is proportional to
 how many documents contain the query terms, not to `N`. A term absent from the
@@ -491,6 +654,38 @@ uv run python scripts/demo.py
 uv run python scripts/rebuild_benchmark.py
 ```
 
+### Run a local multi-process cluster
+
+No containers needed — these are ordinary OS processes talking real HTTP:
+
+```bash
+uv run python scripts/run_cluster.py
+```
+
+It starts three shards and a coordinator, each with its own database, waits for
+readiness, and prints the coordinator's address. Then:
+
+```bash
+curl -X PUT localhost:8000/documents/doc-1 -H 'content-type: application/json' -d '{"text": "distributed search"}'
+```
+
+The response names the shard that took the write.
+
+### Run the cluster with Docker Compose
+
+```bash
+docker compose up --build
+```
+
+The coordinator is published on port 8000; each shard keeps its own named
+volume, because two shards sharing a database would be sharing a corpus rather
+than partitioning one. The coordinator has no volume: it owns no documents.
+
+**These Docker commands are unverified.** Docker is not installed on the machine
+this was developed on, so the image has never been built here. The distributed
+system itself does not depend on Docker and was verified with real multi-process
+clusters; Compose is a packaging convenience, not the architecture.
+
 ### Run the quality gates
 
 ```bash
@@ -521,6 +716,16 @@ override them locally; `.env` is git-ignored.
 | `PYSEARCH_ENVIRONMENT` | `local` | `local`, `test`, `production` |
 | `PYSEARCH_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (case-insensitive) |
 | `PYSEARCH_STORAGE_PATH` | `pysearch.db` | path to the SQLite corpus; parent directories are created |
+| `PYSEARCH_NODE_ROLE` | `single` | `single`, `shard`, `coordinator` |
+| `PYSEARCH_SHARD_COUNT` | `1` | shards in the cluster; fixed for its lifetime |
+| `PYSEARCH_SHARD_ID` | — | required on a shard; must be in `[0, shard_count)` |
+| `PYSEARCH_SHARD_URLS` | — | required on a coordinator; comma-separated, indexed by shard id |
+| `PYSEARCH_CONNECT_TIMEOUT` | `1.0` | seconds |
+| `PYSEARCH_REQUEST_TIMEOUT` | `2.0` | seconds |
+
+Inconsistent topologies fail at startup rather than in flight: a shard without
+an id, a shard id outside the shard count, a coordinator without URLs, a URL
+count that disagrees with the shard count, or duplicate shard URLs.
 
 Invalid values fail loudly at startup rather than being silently ignored.
 
@@ -567,7 +772,7 @@ Document model, text normalization, tokenization, inverted index, posting lists,
 term- and document-frequency statistics, BM25 ranking, indexing and search APIs.
 Implemented directly rather than delegated to a search library.
 
-### Phase 2 — Storage and index persistence ✅ *current*
+### Phase 2 — Storage and index persistence ✅
 
 A durable SQLite document corpus behind a narrow `DocumentStore` protocol,
 transactional writes, startup recovery that rebuilds all derived state, an
@@ -575,13 +780,12 @@ explicit degraded state, and readiness reporting. Index snapshots and an
 application-level write-ahead log were both evaluated and deliberately not
 built; the reasoning is above.
 
-### Phase 3 — Distributed search
+### Phase 3 — Distributed search ✅ *current*
 
-Search nodes, deterministic document routing, sharding, a coordinator node,
-inter-node communication, parallel query fan-out, distributed top-k merging, and
-a cluster-aware search API. Containerization (Docker and Docker Compose) is
-expected to land in this phase, where reproducible multi-node local deployment
-becomes a genuine requirement.
+Shard nodes and a coordinator, BLAKE2b modulo routing, an internal HTTP node
+API, parallel fan-out, cluster-wide BM25 statistics, deterministic global top-k
+merging, a fail-whole partial-failure policy, and a Docker Compose topology for
+reproducible multi-node local deployment.
 
 ### Phase 4 — Reliability and scalability
 
@@ -625,19 +829,26 @@ app/
 │   ├── errors.py     transport-agnostic errors
 │   ├── index.py      inverted index, posting lists, corpus statistics
 │   └── ranking.py    BM25
-└── storage/          durable corpus — no FastAPI in here either
-    ├── base.py       the DocumentStore protocol
-    ├── errors.py     StorageError, StorageInitializationError
-    └── sqlite_store.py
+├── storage/          durable corpus — no FastAPI in here either
+│   ├── base.py       the DocumentStore protocol
+│   ├── errors.py     StorageError, StorageInitializationError
+│   └── sqlite_store.py
+└── cluster/          distributed logic — no FastAPI in here either
+    ├── routing.py    stable hash routing
+    ├── client.py     the ShardClient protocol and its HTTP implementation
+    ├── coordinator.py fan-out, global statistics, merge, failure policy
+    └── errors.py     ShardUnavailableError, ShardTimeoutError, ...
 scripts/
 ├── demo.py              runnable walkthrough, including a restart
-└── rebuild_benchmark.py startup recovery cost by corpus size
+├── rebuild_benchmark.py startup recovery cost by corpus size
+└── run_cluster.py       a real multi-process cluster, without containers
+Dockerfile, docker-compose.yml   reproducible multi-node deployment
 tests/unit/           analysis, index, ranking, engine, storage, persistence
 tests/integration/    the HTTP API, and restart recovery
 ```
 
-Modules for distribution will be created when the phase that needs them begins —
-not in advance.
+Modules for replication and cluster membership will be created when the phase
+that needs them begins — not in advance.
 
 ## Independence and attribution
 

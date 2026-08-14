@@ -10,6 +10,7 @@ formatter.
 import json
 import logging
 import sys
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -81,8 +82,32 @@ def _extra_fields(record: logging.LogRecord) -> dict[str, Any]:
     return {key: value for key, value in record.__dict__.items() if key not in excluded}
 
 
-def configure_logging(level: str) -> None:
+class NodeContextFilter(logging.Filter):
+    """Stamps fixed node metadata onto every record.
+
+    This is the extension point the formatter was designed around: in a cluster,
+    a log line is close to useless unless it says which node produced it, and
+    attaching that here means no call site has to remember to.
+    """
+
+    def __init__(self, context: Mapping[str, Any]) -> None:
+        super().__init__()
+        self._context = dict(context)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        for key, value in self._context.items():
+            # Never overwrite a field the call site set deliberately.
+            if not hasattr(record, key):
+                setattr(record, key, value)
+        return True
+
+
+def configure_logging(level: str, context: Mapping[str, Any] | None = None) -> None:
     """Route all logging through a single JSON handler on stdout.
+
+    ``context`` is merged into every record — node role and shard id, in a
+    cluster — so that logs from different nodes stay attributable once they are
+    collected together.
 
     This is idempotent: existing handlers are replaced, so calling it more than
     once (for instance when tests build several application instances) will not
@@ -90,6 +115,11 @@ def configure_logging(level: str) -> None:
     """
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JsonFormatter())
+    if context:
+        # On the handler, not on the root logger: a logger's filters only run
+        # for records logged through that logger directly, so records
+        # propagating up from ``app.*`` would skip them entirely.
+        handler.addFilter(NodeContextFilter(context))
 
     root = logging.getLogger()
     root.handlers.clear()

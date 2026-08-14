@@ -35,12 +35,62 @@ a full pass over the corpus on every query.
 """
 
 from collections import Counter
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 
 from app.search.errors import IndexInvariantError
 
 _EMPTY_POSTINGS: Mapping[str, int] = {}
+
+
+@dataclass(frozen=True, slots=True)
+class CorpusStats:
+    """The corpus-level inputs BM25 needs, for one specific set of terms.
+
+    Distinct from :class:`IndexStats`, which exists for observability. This
+    carries only what scoring consumes — ``N``, the summed document length, and
+    ``df`` for the terms of a single query — which is what keeps it small enough
+    to compute per query and send between nodes.
+    """
+
+    document_count: int
+    total_document_length: int
+    document_frequencies: Mapping[str, int]
+
+    @property
+    def average_document_length(self) -> float:
+        """``avgdl``, or ``0.0`` for an empty corpus."""
+        if self.document_count == 0:
+            return 0.0
+        return self.total_document_length / self.document_count
+
+    def document_frequency(self, term: str) -> int:
+        """``df`` for a term, or ``0`` if it was never collected."""
+        return self.document_frequencies.get(term, 0)
+
+
+def merge_corpus_stats(parts: Iterable[CorpusStats]) -> CorpusStats:
+    """Combine per-shard statistics into corpus-wide ones.
+
+    The sums are exact rather than approximate, because every document lives on
+    exactly one shard. Replication would put the same document behind more than
+    one set of statistics and break that property; it is a later concern.
+    """
+    document_count = 0
+    total_document_length = 0
+    document_frequencies: dict[str, int] = {}
+
+    for part in parts:
+        document_count += part.document_count
+        total_document_length += part.total_document_length
+        for term, frequency in part.document_frequencies.items():
+            document_frequencies[term] = document_frequencies.get(term, 0) + frequency
+
+    return CorpusStats(
+        document_count=document_count,
+        total_document_length=total_document_length,
+        document_frequencies=document_frequencies,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +150,18 @@ class InvertedIndex:
         if not self._document_lengths:
             return 0.0
         return self._total_length / len(self._document_lengths)
+
+    def corpus_stats(self, terms: Iterable[str]) -> CorpusStats:
+        """Return the BM25 inputs for ``terms`` over this index.
+
+        Repeated terms collapse, since ``df`` is a property of a term and not of
+        how often a query mentions it.
+        """
+        return CorpusStats(
+            document_count=self.document_count,
+            total_document_length=self._total_length,
+            document_frequencies={term: self.document_frequency(term) for term in terms},
+        )
 
     def stats(self) -> IndexStats:
         """Return the corpus statistics as a snapshot."""

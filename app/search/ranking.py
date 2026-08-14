@@ -30,7 +30,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from app.search.index import InvertedIndex
+from app.search.index import CorpusStats, InvertedIndex
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,7 +66,12 @@ class BM25Scorer:
         denominator = document_frequency + 0.5
         return math.log(1.0 + numerator / denominator)
 
-    def score_query(self, index: InvertedIndex, terms: Sequence[str]) -> dict[str, float]:
+    def score_query(
+        self,
+        index: InvertedIndex,
+        terms: Sequence[str],
+        corpus_stats: CorpusStats | None = None,
+    ) -> dict[str, float]:
         """Score every document containing at least one query term.
 
         Only the posting lists of the query terms are visited, so the cost is
@@ -80,11 +85,19 @@ class BM25Scorer:
         Iteration follows the given term order, so each document's score is
         accumulated in a fixed sequence and floating-point addition stays
         reproducible run to run.
+
+        ``corpus_stats`` supplies ``N``, ``avgdl`` and ``df`` from outside. Left
+        out, they are read from this index, which is the single-node case. A
+        shard is given corpus-wide statistics instead, so that documents on
+        different shards are scored on the same scale and their scores can be
+        compared and merged; ``tf`` and ``dl`` stay local either way, because
+        they are properties of the document rather than of the corpus.
         """
         scores: dict[str, float] = {}
 
-        document_count = index.document_count
-        average_length = index.average_document_length
+        stats = corpus_stats if corpus_stats is not None else index.corpus_stats(terms)
+        document_count = stats.document_count
+        average_length = stats.average_document_length
         # An empty corpus, or one holding only empty documents, has nothing to
         # score — and guarding here keeps avgdl out of the denominator below.
         if document_count == 0 or average_length == 0.0:
@@ -98,7 +111,7 @@ class BM25Scorer:
             if not postings:
                 continue
 
-            idf = self.inverse_document_frequency(len(postings), document_count)
+            idf = self.inverse_document_frequency(stats.document_frequency(term), document_count)
 
             for document_id, term_frequency in postings.items():
                 length_ratio = index.document_length(document_id) / average_length

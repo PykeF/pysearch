@@ -53,14 +53,14 @@ reader-writer scheme is a later optimisation with measurements behind it.
 
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 
 from app.search.analysis import analyze
 from app.search.document import Document
 from app.search.errors import DocumentNotFoundError, EngineNotReadyError, IndexInvariantError
-from app.search.index import IndexStats, InvertedIndex
+from app.search.index import CorpusStats, IndexStats, InvertedIndex
 from app.search.ranking import BM25Scorer
 from app.storage.base import DocumentStore
 
@@ -200,7 +200,9 @@ class SearchEngine:
     # Querying
     # ------------------------------------------------------------------
 
-    def search(self, query: str, limit: int) -> SearchResults:
+    def search(
+        self, query: str, limit: int, corpus_stats: CorpusStats | None = None
+    ) -> SearchResults:
         """Return the top ``limit`` documents for ``query``, best first.
 
         The query runs through the same analysis pipeline as documents. A query
@@ -210,6 +212,11 @@ class SearchEngine:
         Results are ordered by descending score, then by ascending document id.
         The second key is what makes ties reproducible instead of dependent on
         dictionary iteration order.
+
+        ``corpus_stats`` lets a caller score against statistics wider than this
+        engine's own corpus. A shard is given cluster-wide values so its scores
+        are comparable with the other shards'; omitted, the engine uses its own,
+        which is the single-node case.
 
         Raises:
             EngineNotReadyError: if the engine is not initialized or is degraded.
@@ -222,7 +229,7 @@ class SearchEngine:
             if not terms:
                 return SearchResults(total=0, results=())
 
-            scores = self._scorer.score_query(self._index, terms)
+            scores = self._scorer.score_query(self._index, terms, corpus_stats)
             ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
             results = tuple(
                 SearchResult(
@@ -234,6 +241,19 @@ class SearchEngine:
             )
 
         return SearchResults(total=len(ranked), results=results)
+
+    def corpus_stats(self, terms: Sequence[str]) -> CorpusStats:
+        """Return this engine's BM25 inputs for ``terms``.
+
+        A coordinator sums these across shards to obtain cluster-wide statistics
+        before asking the shards to score anything.
+
+        Raises:
+            EngineNotReadyError: if the engine is not initialized or is degraded.
+        """
+        with self._lock:
+            self._require_operational_locked()
+            return self._index.corpus_stats(terms)
 
     def stats(self) -> IndexStats:
         """Return a snapshot of the corpus statistics.
