@@ -1,5 +1,7 @@
 """API integration tests for indexing and deleting documents."""
 
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from app.core.config import Settings
@@ -81,11 +83,15 @@ def test_index_stats_on_an_empty_index(client: TestClient) -> None:
     }
 
 
-def test_each_application_gets_its_own_index(client: TestClient, settings: Settings) -> None:
+def test_each_application_gets_its_own_index(
+    client: TestClient, settings: Settings, tmp_path: Path
+) -> None:
     # Guards the isolation the client fixture depends on: index state must not
-    # leak between applications through module-level globals.
+    # leak between applications through module-level globals. The second
+    # application gets its own database, since sharing one file would mean
+    # sharing the corpus rather than leaking in-process state.
     client.put("/documents/doc-1", json={"text": "distributed search"})
 
-    other = TestClient(create_app(settings))
-
-    assert other.get("/index/stats").json()["document_count"] == 0
+    other_settings = settings.model_copy(update={"storage_path": tmp_path / "other.db"})
+    with TestClient(create_app(other_settings)) as other:
+        assert other.get("/index/stats").json()["document_count"] == 0

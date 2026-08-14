@@ -2,6 +2,7 @@
 
 import os
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -29,6 +30,13 @@ def test_defaults_apply_when_environment_is_empty() -> None:
     assert settings.app_name == "pysearch"
     assert settings.environment == "local"
     assert settings.log_level == "INFO"
+    assert settings.storage_path == Path("pysearch.db")
+
+
+def test_storage_path_is_read_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PYSEARCH_STORAGE_PATH", "/var/lib/pysearch/corpus.db")
+
+    assert _build().storage_path == Path("/var/lib/pysearch/corpus.db")
 
 
 def test_environment_variables_override_defaults(monkeypatch: pytest.MonkeyPatch) -> None:

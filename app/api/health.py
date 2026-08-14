@@ -1,9 +1,11 @@
-"""Health endpoint."""
+"""Liveness and readiness endpoints."""
 
 from typing import Literal
 
-from fastapi import APIRouter
-from pydantic import BaseModel
+from fastapi import APIRouter, Response, status
+from pydantic import BaseModel, Field
+
+from app.api.dependencies import EngineDep
 
 router = APIRouter(tags=["health"])
 
@@ -14,12 +16,43 @@ class HealthResponse(BaseModel):
     status: Literal["ok"] = "ok"
 
 
-@router.get("/health", summary="Report service health")
-def health() -> HealthResponse:
-    """Report that the service is running and able to serve requests.
+class ReadinessResponse(BaseModel):
+    """Body returned by the readiness endpoint."""
 
-    Phase 0 has no storage, indexes or peer nodes, so this is deliberately a
-    pure liveness check rather than a readiness check over dependencies that do
-    not exist yet.
+    status: Literal["ready", "not_ready"]
+    detail: str = Field(description="Why the service is not ready, when it is not.")
+
+
+@router.get("/health", summary="Report process liveness")
+def health() -> HealthResponse:
+    """Report that the process is running.
+
+    Deliberately checks nothing else: a liveness probe answers "should this
+    process be restarted", and reporting failure here because storage is
+    momentarily unavailable would restart a perfectly healthy process. Whether
+    the service can actually serve is what ``/ready`` is for.
     """
     return HealthResponse()
+
+
+@router.get(
+    "/ready",
+    summary="Report whether the service can serve requests",
+    responses={
+        status.HTTP_200_OK: {"description": "Storage is open and derived state is trusted."},
+        status.HTTP_503_SERVICE_UNAVAILABLE: {
+            "description": "The engine is uninitialized or degraded."
+        },
+    },
+)
+def ready(engine: EngineDep, response: Response) -> ReadinessResponse:
+    """Report readiness: storage open, index rebuilt, derived state trusted.
+
+    Returns 503 while the engine is degraded, which is the state it enters if a
+    durable write commits but the derived in-memory structures fail to follow.
+    """
+    engine_status = engine.status()
+    if not engine_status.ready:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return ReadinessResponse(status="not_ready", detail=engine_status.detail)
+    return ReadinessResponse(status="ready", detail=engine_status.detail)

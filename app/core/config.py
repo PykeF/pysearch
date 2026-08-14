@@ -5,6 +5,7 @@ how to *read* settings, and nothing about what they are used for.
 """
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic import field_validator
@@ -33,6 +34,10 @@ class Settings(BaseSettings):
     app_name: str = "pysearch"
     environment: Environment = "local"
     log_level: LogLevel = "INFO"
+
+    #: SQLite database holding the authoritative document corpus. Parent
+    #: directories are created on startup if they do not exist.
+    storage_path: Path = Path("pysearch.db")
 
     @field_validator("log_level", mode="before")
     @classmethod

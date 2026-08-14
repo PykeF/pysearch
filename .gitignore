@@ -24,6 +24,12 @@ htmlcov/
 .env.*
 !.env.example
 
+# Local SQLite corpus, including SQLite's transient journal/WAL sidecar files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
 # Editors and local tooling state
 .idea/
 .vscode/

@@ -9,11 +9,6 @@ from app.search.engine import SearchEngine
 from app.search.errors import DocumentNotFoundError, InvalidDocumentError
 
 
-@pytest.fixture
-def engine() -> SearchEngine:
-    return SearchEngine()
-
-
 def index(engine: SearchEngine, documents: dict[str, str]) -> None:
     for document_id, text in documents.items():
         engine.index_document(Document(document_id=document_id, text=text))

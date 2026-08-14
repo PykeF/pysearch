@@ -17,6 +17,15 @@ class DocumentNotFoundError(SearchError):
     """An operation referenced a document that is not indexed."""
 
 
+class EngineNotReadyError(SearchError):
+    """The engine cannot serve requests.
+
+    Either it has not been initialized yet, or a durable write committed while
+    the derived in-memory state failed to follow, leaving that state untrusted
+    until it is rebuilt from storage.
+    """
+
+
 class IndexInvariantError(SearchError):
     """The index's internal structures disagree with one another.
 

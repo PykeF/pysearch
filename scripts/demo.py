@@ -1,4 +1,4 @@
-"""A deterministic walkthrough of the Phase 1 search engine.
+"""A deterministic walkthrough of the search engine.
 
 Run it with::
 
@@ -7,15 +7,19 @@ Run it with::
 It uses the search core directly, without starting the web application, which
 is the point: the retrieval code has no dependency on FastAPI.
 
-The first section works one layer down, on the inverted index itself, to show
-what the engine keeps underneath. The second section drives the engine the way
-the API does.
+The three sections work bottom-up — the inverted index on its own, then the
+engine, then a restart proving the corpus is durable. A temporary directory is
+used so running the demo leaves nothing behind.
 """
+
+import tempfile
+from pathlib import Path
 
 from app.search.analysis import analyze
 from app.search.document import Document
 from app.search.engine import SearchEngine
 from app.search.index import InvertedIndex
+from app.storage.sqlite_store import SqliteDocumentStore
 
 CORPUS = {
     "doc-1": "Distributed systems make search scalable across many machines.",
@@ -60,42 +64,85 @@ def print_results(engine: SearchEngine, query: str) -> None:
         print(f"  {rank}. {hit.document_id}  score={hit.score:.4f}  {hit.text}")
 
 
-def show_engine() -> None:
+def start_engine(database: Path) -> SearchEngine:
+    """Open storage and bring an engine up against it, exactly as startup does."""
+    engine = SearchEngine(SqliteDocumentStore.open(database))
+    report = engine.initialize()
+    print(
+        f"\nrecovered {report.document_count} documents from {database.name} "
+        f"in {report.duration_seconds * 1000:.2f} ms"
+    )
+    return engine
+
+
+def show_engine(database: Path) -> None:
     """Index the corpus, query it, then update and delete a document."""
     print("\n" + "=" * 70)
     print("the engine")
     print("=" * 70)
 
-    engine = SearchEngine()
-    for document_id, text in CORPUS.items():
-        engine.index_document(Document(document_id=document_id, text=text))
+    engine = start_engine(database)
+    try:
+        for document_id, text in CORPUS.items():
+            engine.index_document(Document(document_id=document_id, text=text))
 
-    stats = engine.stats()
-    print(f"\ndocuments {stats.document_count}", end="")
-    print(f" | unique terms {stats.unique_term_count}", end="")
-    print(f" | avg length {stats.average_document_length:.2f}")
+        stats = engine.stats()
+        print(f"\ndocuments {stats.document_count}", end="")
+        print(f" | unique terms {stats.unique_term_count}", end="")
+        print(f" | avg length {stats.average_document_length:.2f}")
 
-    for query in QUERIES:
-        print_results(engine, query)
+        for query in QUERIES:
+            print_results(engine, query)
 
-    print("\n-- replacing doc-6 --")
-    engine.index_document(
-        Document(document_id="doc-6", text="Replication keeps copies of a shard on other nodes.")
-    )
-    print_results(engine, "pasta")
-    print_results(engine, "replication")
+        print("\n-- replacing doc-6 --")
+        engine.index_document(
+            Document(
+                document_id="doc-6", text="Replication keeps copies of a shard on other nodes."
+            )
+        )
+        print_results(engine, "pasta")
+        print_results(engine, "replication")
 
-    print("\n-- deleting doc-1 --")
-    engine.delete_document("doc-1")
-    print_results(engine, "search")
+        print("\n-- deleting doc-1 --")
+        engine.delete_document("doc-1")
+        print_results(engine, "search")
 
-    engine.validate()
-    print("\nindex invariants hold")
+        engine.validate()
+        print("\ninvariants hold")
+    finally:
+        engine.close()
+
+
+def show_restart(database: Path) -> None:
+    """Reopen the same database and prove the corpus and results survived."""
+    print("\n" + "=" * 70)
+    print("restart")
+    print("=" * 70)
+
+    engine = start_engine(database)
+    try:
+        stats = engine.stats()
+        print(f"\ndocuments {stats.document_count}", end="")
+        print(f" | unique terms {stats.unique_term_count}", end="")
+        print(f" | avg length {stats.average_document_length:.2f}")
+
+        # The update and the deletion from the previous section are still in
+        # effect, because SQLite — not the in-memory index — is the corpus.
+        for query in ("search", "replication", "pasta"):
+            print_results(engine, query)
+
+        engine.validate()
+        print("\ninvariants hold after recovery")
+    finally:
+        engine.close()
 
 
 def main() -> None:
     show_index_internals()
-    show_engine()
+    with tempfile.TemporaryDirectory() as directory:
+        database = Path(directory) / "demo.db"
+        show_engine(database)
+        show_restart(database)
 
 
 if __name__ == "__main__":
