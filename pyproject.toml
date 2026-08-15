@@ -4,6 +4,16 @@ version = "0.1.0"
 description = "An educational distributed search engine built from scratch in Python."
 readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["search-engine", "information-retrieval", "bm25", "vector-search", "distributed"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+]
 dependencies = [
     "fastapi>=0.115",
     "httpx2>=2.10.0",
@@ -62,3 +72,11 @@ select = [
 python_version = "3.12"
 strict = true
 warn_unreachable = true
+
+# The semantic extra is optional, so these are absent from a plain `uv sync`.
+# Both imports are already guarded by try/ImportError at their call site; this
+# keeps the type-check result identical whether or not the extra is installed,
+# so CI does not need a different dependency set from a developer's checkout.
+[[tool.mypy.overrides]]
+module = ["model2vec.*", "huggingface_hub.*"]
+ignore_missing_imports = true

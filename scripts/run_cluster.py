@@ -63,7 +63,14 @@ def wait_until_ready(url: str, timeout: float = READY_TIMEOUT_SECONDS) -> bool:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Run a real multi-process PySearch cluster locally, without containers.",
+        epilog=(
+            "With --replication-factor 2 each logical shard gets a primary and a replica: "
+            "kill a primary and search keeps working from its replica, while writes to "
+            "that shard start failing. See docs/development.md."
+        ),
+    )
     parser.add_argument("--shards", type=int, default=3, help="number of logical shards")
     parser.add_argument(
         "--replication-factor",

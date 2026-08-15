@@ -10,7 +10,11 @@ ENV UV_COMPILE_BYTECODE=1 \
 
 WORKDIR /srv
 
-# Dependency layer first, so editing application code does not re-resolve.
+# uv sync installs the project itself, so the package source has to be present
+# before it runs. That means editing application code does invalidate this
+# layer; splitting it with --no-install-project would fix that, and is left
+# alone because no Docker build has been run to verify the change. The
+# resolution itself is still pinned by uv.lock.
 COPY pyproject.toml uv.lock README.md ./
 COPY app ./app
 # The semantic extra brings numpy, tokenizers and the model2vec loader. It adds

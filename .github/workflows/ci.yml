@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to the same branch cancels the first: the older result is
+# already stale by the time it finishes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The package claims `requires-python = ">=3.12"`, so the lower bound is
+        # verified rather than assumed. 3.13 is the recommended local
+        # interpreter (.python-version) and the one the Dockerfile builds on.
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      # --frozen resolves nothing: the committed uv.lock is used exactly as it
+      # is, so CI installs what a developer installs. It fails loudly if the
+      # lockfile and pyproject.toml have drifted apart.
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # These four commands are the documented local quality gates, verbatim.
+      # There is deliberately no separate CI dependency or lint configuration.
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format
+        run: uv run ruff format --check .
+
+      - name: Type-check
+        run: uv run mypy app
+
+      # The suite runs against a deterministic fake embedder and never reaches
+      # the network: `addopts` deselects the `semantic_model` marker, and the
+      # `semantic` extra is not installed here. Tests that load the real model
+      # are run locally with:
+      #     uv run --extra semantic pytest -m semantic_model
+      - name: Test
+        run: uv run pytest

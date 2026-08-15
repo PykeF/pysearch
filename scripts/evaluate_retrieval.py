@@ -214,7 +214,14 @@ def report(engine: SearchEngine) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Compare lexical, semantic and hybrid retrieval on the labelled set.",
+        epilog=(
+            "Without --develop, all three modes are evaluated on the held-out queries "
+            "with the parameters frozen. See docs/evaluation.md for the results and "
+            "their limitations."
+        ),
+    )
     parser.add_argument(
         "--develop",
         action="store_true",

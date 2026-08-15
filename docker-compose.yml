@@ -14,6 +14,14 @@
 #
 # Every physical node gets its own volume. A primary and its replica pointed at
 # one database would be two views of a single copy, which is not replication.
+#
+# Known limitation: the coordinator has no volume, correctly — it owns no
+# documents — but HF_HOME points at /data, so its model cache lives in the
+# container layer and is re-downloaded on every restart. Shard nodes cache the
+# model in their own volumes and are unaffected.
+#
+# This topology has never been run: Docker was unavailable throughout
+# development. It is statically validated only. See docs/development.md.
 
 x-node: &node
   build: .

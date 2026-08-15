@@ -2,19 +2,25 @@
 
 Run it with::
 
-    uv run python scripts/demo.py
+    uv run python scripts/demo.py                    # lexical only
+    uv run --extra semantic python scripts/demo.py   # all three retrieval modes
 
 It uses the search core directly, without starting the web application, which
 is the point: the retrieval code has no dependency on FastAPI.
 
-The three sections work bottom-up — the inverted index on its own, then the
-engine, then a restart proving the corpus is durable. A temporary directory is
-used so running the demo leaves nothing behind.
+The sections work bottom-up — the inverted index on its own, then the engine,
+then a restart proving the corpus is durable, then the semantic and hybrid modes
+that build on the same documents. The last two need the optional ``semantic``
+extra; without it they are skipped with a note rather than failing, so the demo
+works on a plain ``uv sync``.
+
+A temporary directory is used so running the demo leaves nothing behind.
 """
 
 import tempfile
 from pathlib import Path
 
+from app.hybrid.fusion import FusionConfig
 from app.search.analysis import analyze
 from app.search.document import Document
 from app.search.engine import SearchEngine
@@ -137,12 +143,95 @@ def show_restart(database: Path) -> None:
         engine.close()
 
 
+def load_embedder() -> tuple[object | None, str]:
+    """Return a real embedder, or None and the reason it is unavailable.
+
+    The demo must work on a plain ``uv sync``, so a missing model2vec is an
+    expected outcome rather than an error.
+    """
+    try:
+        from app.semantic.embedder import Model2VecEmbedder
+
+        return Model2VecEmbedder.load(), ""
+    except Exception as error:
+        # Broad on purpose: a missing extra, a missing model and a failed
+        # download are all just "no semantic section", and the reason is shown.
+        return None, str(error)
+
+
+def show_semantic_and_hybrid(database: Path) -> None:
+    """Compare the three retrieval modes on one corpus.
+
+    A separate database from the lexical sections, because those deliberately
+    delete and replace documents and this section wants the corpus intact.
+    """
+    print("\n" + "=" * 70)
+    print("semantic and hybrid retrieval")
+    print("=" * 70)
+
+    embedder, reason = load_embedder()
+    if embedder is None:
+        print(f"\nSkipped — {reason}")
+        print("\nRun `uv sync --extra semantic` and try again to see:")
+        print("  - semantic search matching a paraphrase with no shared words")
+        print("  - Reciprocal Rank Fusion combining both rankings")
+        return
+
+    engine = SearchEngine(SqliteDocumentStore.open(database), embedder=embedder)  # type: ignore[arg-type]
+    engine.initialize()
+    try:
+        for document_id, text in CORPUS.items():
+            engine.index_document(Document(document_id=document_id, text=text))
+        print(f"\nindexed {len(CORPUS)} documents with vectors")
+
+        # The first query is a paraphrase whose only lexical match is the stop
+        # word "a" — so BM25 confidently returns the wrong document, and fusion
+        # inherits that mistake. That is the failure mode documented in
+        # docs/evaluation.md, reproduced here in six documents. The second query
+        # shares real vocabulary with two documents, so both signals agree and
+        # fusion behaves as intended.
+        for query in ("preparing a meal", "splitting data over many computers"):
+            print(f"\n{'-' * 70}\nquery {query!r}")
+
+            lexical = engine.search(query, limit=3)
+            print(f"\n  BM25          (matched {lexical.total})")
+            if not lexical.results:
+                print("    no results — no document contains any of these terms")
+            for rank, hit in enumerate(lexical.results, start=1):
+                print(f"    {rank}. {hit.document_id}  score={hit.score:.4f}")
+
+            semantic = engine.semantic_search(engine.embed_query(query), limit=3)
+            print(f"\n  semantic      (searched {semantic.total})")
+            for rank, hit in enumerate(semantic.results, start=1):
+                print(f"    {rank}. {hit.document_id}  score={hit.score:.4f}")
+
+            hybrid = engine.hybrid_search(query, limit=3, config=FusionConfig())
+            print(f"\n  hybrid (RRF)  (fused {hybrid.total} candidates)")
+            for rank, hit in enumerate(hybrid.results, start=1):
+                origin = f"lex={hit.lexical_rank or '-'} sem={hit.semantic_rank or '-'}"
+                print(f"    {rank}. {hit.document_id}  score={hit.score:.6f}  [{origin}]")
+
+        print("\n" + "-" * 70)
+        print("The fusion score is a sum of reciprocal ranks — not a BM25 score,")
+        print("not a cosine similarity, and not a probability. It means something")
+        print("only relative to the other results in the same response.")
+        print()
+        print("Note the first query: BM25's only match was the stop word 'a', and")
+        print("fusion promoted that wrong document above the one semantic search")
+        print("ranked first. There is no stop-word filtering, so a confidently")
+        print("wrong lexical hit outranks a correct semantic one. This is the")
+        print("measured failure mode in docs/evaluation.md, not a bug in fusion.")
+    finally:
+        engine.close()
+
+
 def main() -> None:
     show_index_internals()
     with tempfile.TemporaryDirectory() as directory:
         database = Path(directory) / "demo.db"
         show_engine(database)
         show_restart(database)
+        show_semantic_and_hybrid(Path(directory) / "demo-semantic.db")
 
 
 if __name__ == "__main__":
