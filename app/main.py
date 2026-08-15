@@ -22,6 +22,7 @@ from app.api.cluster import router as cluster_router
 from app.api.documents import router as documents_router
 from app.api.health import readiness_router
 from app.api.health import router as health_router
+from app.api.hybrid import router as hybrid_router
 from app.api.index import router as index_router
 from app.api.internal import router as internal_router
 from app.api.search import router as search_router
@@ -325,6 +326,7 @@ def create_app(
             app.include_router(search_router)
             app.include_router(index_router)
             app.include_router(semantic_router)
+            app.include_router(hybrid_router)
 
     app.state.settings = settings
     _register_error_handlers(app)

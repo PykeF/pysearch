@@ -15,9 +15,10 @@ from app.cluster.errors import DistributedSearchError, ShardTimeoutError, ShardU
 from app.cluster.routing import ShardRouter
 from app.cluster.topology import build_topology
 from app.search.document import Document
-from app.search.engine import SearchEngine, SearchResult, SearchResults
+from app.search.engine import SearchEngine
 from app.search.errors import DocumentNotFoundError
 from app.search.index import CorpusStats, IndexStats
+from app.search.results import SearchResult, SearchResults
 from app.storage.sqlite_store import IN_MEMORY, SqliteDocumentStore
 
 

@@ -17,9 +17,9 @@ import httpx2
 
 from app.cluster.errors import ShardTimeoutError, ShardUnavailableError
 from app.search.document import Document
-from app.search.engine import SearchResult, SearchResults
 from app.search.errors import DocumentNotFoundError
 from app.search.index import CorpusStats, IndexStats
+from app.search.results import SearchResult, SearchResults
 from app.semantic.embedder import SemanticIdentity
 
 

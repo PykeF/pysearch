@@ -13,7 +13,8 @@ from fastapi.testclient import TestClient
 from app.core.config import Settings
 from app.main import create_app
 from app.search.document import Document
-from app.search.engine import SearchEngine, SearchResults
+from app.search.engine import SearchEngine
+from app.search.results import SearchResults
 from app.storage.sqlite_store import SqliteDocumentStore
 
 CORPUS = {

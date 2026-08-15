@@ -89,10 +89,11 @@ from app.cluster.errors import (
 )
 from app.cluster.routing import ShardRouter
 from app.cluster.topology import ClusterTopology, ShardCopies
+from app.hybrid.fusion import FusionConfig, HybridResults, reciprocal_rank_fusion
 from app.search.analysis import analyze
 from app.search.document import Document
-from app.search.engine import SearchResults
 from app.search.index import CorpusStats, IndexStats, merge_corpus_stats
+from app.search.results import SearchResults
 from app.semantic.embedder import Embedder, SemanticIdentity
 from app.semantic.errors import SemanticDisabledError
 
@@ -286,16 +287,27 @@ class Coordinator:
         unique_terms = sorted(set(terms))
 
         async with self._lock:
-            # Round 1 both collects statistics and decides which physical copy
-            # of each logical shard is serving this query.
-            selection = await self._select_and_collect(unique_terms)
-            corpus_stats = merge_corpus_stats(stats for _, stats in selection)
-            if corpus_stats.document_count == 0:
-                return SearchResults(total=0, results=())
-            shard_results = await self._fan_out_search(
-                query, limit, corpus_stats, [client for client, _ in selection]
-            )
+            return await self._search_locked(query, unique_terms, limit)
 
+    async def _search_locked(
+        self, query: str, unique_terms: Sequence[str], limit: int
+    ) -> SearchResults:
+        """Run the two-round lexical protocol without taking the lock.
+
+        Split out so hybrid retrieval can run this and the semantic fan-out
+        under a *single* acquisition. The lock is not reentrant, so a hybrid
+        method calling the public wrappers would deadlock rather than serialise.
+        """
+        # Round 1 both collects statistics and decides which physical copy of
+        # each logical shard is serving this query.
+        selection = await self._select_and_collect(unique_terms)
+        corpus_stats = merge_corpus_stats(stats for _, stats in selection)
+        if corpus_stats.document_count == 0:
+            return SearchResults(total=0, results=())
+
+        shard_results = await self._fan_out_search(
+            query, limit, corpus_stats, [client for client, _ in selection]
+        )
         return self._merge(shard_results, limit)
 
     async def semantic_search(self, query: str, limit: int) -> SearchResults:
@@ -323,14 +335,19 @@ class Coordinator:
         vector = self._embedder.embed_query(query).tolist()
 
         async with self._lock:
-            shard_results = await self._gather(
-                [
-                    self._semantic_from_any_copy(copies, vector, limit, identity)
-                    for copies in self._topology
-                ],
-                "executing distributed semantic search",
-            )
+            return await self._semantic_search_locked(vector, limit, identity)
 
+    async def _semantic_search_locked(
+        self, vector: Sequence[float], limit: int, identity: SemanticIdentity
+    ) -> SearchResults:
+        """Run the one-round semantic fan-out without taking the lock."""
+        shard_results = await self._gather(
+            [
+                self._semantic_from_any_copy(copies, vector, limit, identity)
+                for copies in self._topology
+            ],
+            "executing distributed semantic search",
+        )
         return self._merge(shard_results, limit)
 
     async def _semantic_from_any_copy(
@@ -358,6 +375,68 @@ class Coordinator:
             f"every copy of logical shard {copies.shard_id} is unavailable",
             shard_id=copies.shard_id,
         ) from (failures[0] if failures else None)
+
+    async def hybrid_search(
+        self, query: str, limit: int, config: FusionConfig | None = None
+    ) -> HybridResults:
+        """Retrieve lexically and semantically, then fuse the two rankings.
+
+        Both retrievals run inside **one** acquisition of the operation lock, so
+        they see the same corpus. Without that, a routed write could land
+        between them and the fused ranking would combine a lexical view of one
+        state with a semantic view of another.
+
+        Inside the lock they run concurrently. Each is a network fan-out that
+        spends its time waiting, so overlapping them makes the critical path
+        roughly the slower of the two rather than their sum — while the total
+        network work is still the lexical protocol's two rounds plus the
+        semantic protocol's one.
+
+        Either path failing fails the whole request. "Hybrid" asserts that both
+        signals took part, so returning one of them under that name would be a
+        lie. A lexical result that is merely *empty*, though, is not a failure:
+        BM25 legitimately matches nothing for a paraphrase, and fusion handles
+        that as an ordinary one-sided contribution.
+
+        Raises:
+            SemanticDisabledError: if this coordinator has no embedder.
+            DistributedSearchError: if a logical shard has no usable copy.
+        """
+        settings = config if config is not None else FusionConfig()
+
+        terms = analyze(query)
+        if not terms:
+            # Answered without asking the model what an empty string means.
+            return HybridResults(total=0, results=())
+        if self._embedder is None:
+            raise SemanticDisabledError(
+                "hybrid search requires semantic search, which is not enabled on this coordinator"
+            )
+
+        unique_terms = sorted(set(terms))
+        identity = self._embedder.identity
+        # Embedded once for the whole request, as the semantic path does.
+        vector = self._embedder.embed_query(query).tolist()
+        depth = settings.candidate_depth(limit)
+
+        async with self._lock:
+            outcomes = await asyncio.gather(
+                self._search_locked(query, unique_terms, depth),
+                self._semantic_search_locked(vector, depth, identity),
+                # Collected rather than propagated immediately, so the other
+                # fan-out is allowed to finish instead of being left dangling.
+                return_exceptions=True,
+            )
+
+        retrieved: list[SearchResults] = []
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                raise outcome
+            retrieved.append(outcome)
+
+        lexical, semantic = retrieved
+        # Fusion is pure, so it runs outside the lock.
+        return reciprocal_rank_fusion(lexical, semantic, limit, settings)
 
     async def index_stats(self) -> ClusterStats:
         """Aggregate index statistics across the cluster."""

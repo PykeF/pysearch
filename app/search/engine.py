@@ -59,11 +59,13 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
+from app.hybrid.fusion import FusionConfig, HybridResults, reciprocal_rank_fusion
 from app.search.analysis import analyze
 from app.search.document import Document
 from app.search.errors import DocumentNotFoundError, EngineNotReadyError, IndexInvariantError
 from app.search.index import CorpusStats, IndexStats, InvertedIndex
 from app.search.ranking import BM25Scorer
+from app.search.results import SearchResult, SearchResults
 from app.semantic.embedder import Embedder, SemanticIdentity
 from app.semantic.errors import SemanticDisabledError
 from app.semantic.vector_index import ExactVectorIndex
@@ -76,23 +78,6 @@ if TYPE_CHECKING:  # pragma: no cover - imported for typing only
 #: Documents are embedded in batches during a rebuild, because a model call per
 #: document wastes most of the work a batched encoder can do.
 _EMBEDDING_BATCH_SIZE = 64
-
-
-@dataclass(frozen=True, slots=True)
-class SearchResult:
-    """One ranked hit."""
-
-    document_id: str
-    score: float
-    text: str
-
-
-@dataclass(frozen=True, slots=True)
-class SearchResults:
-    """A page of ranked hits, plus how many documents matched in total."""
-
-    total: int
-    results: tuple[SearchResult, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -461,19 +446,64 @@ class SearchEngine:
         """
         with self._lock:
             self._require_operational_locked()
-            if self._vectors is None:
-                raise SemanticDisabledError("semantic search is not enabled on this node")
+            return self._semantic_search_locked(vector, limit)
 
-            hits = self._vectors.search(vector, limit)
-            results = tuple(
-                SearchResult(
-                    document_id=hit.document_id,
-                    score=hit.score,
-                    text=self._documents[hit.document_id].text,
-                )
-                for hit in hits
+    def _semantic_search_locked(self, vector: "NDArray[np.float32]", limit: int) -> SearchResults:
+        """Rank by cosine similarity without taking the lock. Caller holds it."""
+        if self._vectors is None:
+            raise SemanticDisabledError("semantic search is not enabled on this node")
+
+        hits = self._vectors.search(vector, limit)
+        results = tuple(
+            SearchResult(
+                document_id=hit.document_id,
+                score=hit.score,
+                text=self._documents[hit.document_id].text,
             )
-            return SearchResults(total=self._vectors.count, results=results)
+            for hit in hits
+        )
+        return SearchResults(total=self._vectors.count, results=results)
+
+    def hybrid_search(
+        self, query: str, limit: int, config: FusionConfig | None = None
+    ) -> HybridResults:
+        """Retrieve lexically and semantically, then fuse the two rankings.
+
+        Both retrievals run under **one** acquisition of the engine lock, so
+        they observe the same corpus: without that, a concurrent write could
+        land between them and the fused ranking would combine two different
+        states.
+
+        They run sequentially rather than in parallel. Both are in-memory CPU
+        work against state the lock already protects, so threads would add
+        machinery and contention without shortening anything — unlike the
+        coordinator, where each path waits on the network.
+
+        Raises:
+            SemanticDisabledError: if semantic search is not enabled here.
+            EngineNotReadyError: if this copy is not READY.
+        """
+        settings = config if config is not None else FusionConfig()
+
+        terms = analyze(query)
+        if not terms:
+            # A query with no terms is answered without asking the model what an
+            # empty string means.
+            return HybridResults(total=0, results=())
+        if self._embedder is None:
+            raise SemanticDisabledError(
+                "hybrid search requires semantic search, which is not enabled on this node"
+            )
+
+        vector = self._embedder.embed_query(query)
+        depth = settings.candidate_depth(limit)
+
+        with self._lock:
+            self._require_operational_locked()
+            lexical = self._search_locked(terms, depth, None)
+            semantic = self._semantic_search_locked(vector, depth)
+
+        return reciprocal_rank_fusion(lexical, semantic, limit, settings)
 
     def _embed_document(self, text: str) -> "NDArray[np.float32] | None":
         """Embed one document, or return ``None`` when semantic is disabled.
@@ -534,21 +564,31 @@ class SearchEngine:
 
         with self._lock:
             self._require_operational_locked()
+            return self._search_locked(terms, limit, corpus_stats)
 
-            if not terms:
-                return SearchResults(total=0, results=())
+    def _search_locked(
+        self, terms: Sequence[str], limit: int, corpus_stats: CorpusStats | None
+    ) -> SearchResults:
+        """Rank by BM25 without taking the lock. Caller holds it.
 
-            scores = self._scorer.score_query(self._index, terms, corpus_stats)
-            ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
-            results = tuple(
-                SearchResult(
-                    document_id=document_id,
-                    score=score,
-                    text=self._documents[document_id].text,
-                )
-                for document_id, score in ranked[:limit]
+        Split out so that hybrid retrieval can run this and the semantic search
+        under a *single* acquisition. The lock is not reentrant, so a hybrid
+        method calling the public wrappers would deadlock rather than merely
+        serialise.
+        """
+        if not terms:
+            return SearchResults(total=0, results=())
+
+        scores = self._scorer.score_query(self._index, terms, corpus_stats)
+        ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+        results = tuple(
+            SearchResult(
+                document_id=document_id,
+                score=score,
+                text=self._documents[document_id].text,
             )
-
+            for document_id, score in ranked[:limit]
+        )
         return SearchResults(total=len(ranked), results=results)
 
     def corpus_stats(self, terms: Sequence[str]) -> CorpusStats:

@@ -12,6 +12,8 @@ from fastapi import APIRouter, Depends, Query, Request, Response, status
 from pydantic import BaseModel, Field
 
 from app.api.documents import IndexDocumentRequest
+from app.api.hybrid import HybridSearchResponse
+from app.api.hybrid import to_response as to_hybrid_response
 from app.api.search import DEFAULT_LIMIT, MAX_LIMIT, SearchHit, SearchResponse
 from app.api.semantic import SemanticSearchResponse
 from app.cluster.coordinator import Coordinator
@@ -181,6 +183,38 @@ async def semantic_search(
             for hit in outcome.results
         ],
     )
+
+
+@router.get(
+    "/search/hybrid",
+    summary="Search the cluster lexically and semantically, then fuse",
+    responses={
+        status.HTTP_503_SERVICE_UNAVAILABLE: {
+            "description": "Semantic search is disabled, or a retrieval path failed."
+        }
+    },
+)
+async def hybrid_search(
+    coordinator: CoordinatorDep,
+    q: Annotated[str, Query(description="The query text.")],
+    limit: Annotated[
+        int, Query(ge=1, le=MAX_LIMIT, description="Maximum results to return.")
+    ] = DEFAULT_LIMIT,
+    explain: Annotated[
+        bool, Query(description="Include the underlying lexical and semantic scores.")
+    ] = False,
+) -> HybridSearchResponse:
+    """Combine the distributed BM25 and semantic rankings with Reciprocal Rank Fusion.
+
+    Both retrievals run inside one coordinator operation, so the two rankings
+    describe the same corpus, and they overlap on the network so the request
+    costs roughly the slower of the two rather than their sum.
+
+    If either path fails the request fails: "hybrid" asserts that both signals
+    took part. An empty lexical result is not a failure — BM25 matching nothing
+    is the ordinary outcome for a paraphrase.
+    """
+    return to_hybrid_response(q, await coordinator.hybrid_search(q, limit), explain)
 
 
 @router.get("/index/stats", summary="Report cluster index statistics")

@@ -2,7 +2,7 @@
 
 An educational distributed search engine, written from scratch in Python.
 
-> **Current status: Phase 5 — semantic and vector search.**
+> **Current status: Phase 6 — hybrid search and rank fusion.**
 > PySearch is a working replicated distributed lexical search engine. Documents
 > are partitioned across logical shards by a stable hash; each logical shard has
 > a primary and a replica, each with its own durable SQLite corpus and in-memory
@@ -10,16 +10,19 @@ An educational distributed search engine, written from scratch in Python.
 > replica when a primary is lost. Distributed ranking is equivalent to a single
 > node holding the whole corpus, before and after failover.
 >
-> It now has a **second, independent retrieval path**: documents are embedded
-> and searched by vector similarity through `/search/semantic`, while `/search`
-> remains exactly the BM25 it always was. The two are never combined — that is
-> the next phase's question.
+> It has **three independent retrieval modes**: BM25 through `/search`, vector
+> similarity through `/search/semantic`, and Reciprocal Rank Fusion of the two
+> through `/search/hybrid`. Each remains usable on its own.
+>
+> **On this project's small labelled set, hybrid did not beat semantic alone**
+> (MRR 0.865 against 1.000). It matched or improved on every lexical, mixed and
+> distractor query and lost ground on paraphrases. That result is reported below
+> with the mechanism behind it, rather than tuned away.
 >
 > **Reads fail over automatically; writes do not.** There is no leader election
 > and no automatic promotion, so losing a primary means that logical shard stops
-> accepting writes until it returns. Vector search is **exact, not approximate**,
-> and there is no hybrid ranking. Those are the roadmap below, not features of
-> this code.
+> accepting writes until it returns. Vector search is **exact, not approximate**.
+> Those are the roadmap below, not features of this code.
 
 ## Motivation
 
@@ -36,7 +39,7 @@ effort stays on the parts worth understanding.
 
 ## What exists today
 
-**Implemented (Phases 0–5)**
+**Implemented (Phases 0–6)**
 
 - Unicode-aware text normalization and tokenization, shared by documents and queries
 - An in-memory inverted index with posting lists and term frequencies
@@ -56,17 +59,19 @@ effort stays on the parts worth understanding.
 - **Document and query embeddings behind a swappable model boundary**
 - **An exact vector index with cosine similarity, written here**
 - **Distributed semantic search in a single fan-out round, with failover**
-- **A labelled BM25-versus-semantic evaluation, reported separately**
+- A labelled BM25-versus-semantic evaluation, reported separately
+- **Reciprocal Rank Fusion combining the two rankings, with explainable ranks**
+- **A held-out evaluation of all three modes, by query category**
 - **Docker Compose topology for reproducible multi-node local deployment**
 - HTTP APIs for indexing, deletion, search and index statistics
 - Structured JSON logging carrying node role and shard id
-- 415 tests, strict type checking, linting and formatting gates
+- 475 tests, strict type checking, linting and formatting gates
 
-**Not implemented** — hybrid retrieval, rank fusion, reranking, approximate
-nearest-neighbour search, persisted vectors, leader election, consensus,
-automatic primary promotion, writable failover, dynamic membership,
-rebalancing, coordinator replication, index snapshots, query caching, phrase or
-fuzzy search, stemming, authentication. See the roadmap.
+**Not implemented** — cross-encoder or LLM reranking, learning to rank, query
+expansion, approximate nearest-neighbour search, persisted vectors, leader
+election, consensus, automatic primary promotion, writable failover, dynamic
+membership, rebalancing, coordinator replication, index snapshots, query
+caching, phrase or fuzzy search, stemming, authentication. See the roadmap.
 
 ## Architecture
 
@@ -365,6 +370,233 @@ Rebuild is roughly linear and runs an order of magnitude faster than the origina
 indexing, because indexing pays one fsync per document while recovery is a single
 sequential read. Snapshots would only become worth their consistency cost once
 this column stops being acceptable.
+
+## Hybrid search
+
+### Three modes, one corpus
+
+```text
+                              Query
+                                |
+                  +-------------+-------------+
+                  |                           |
+                  v                           v
+          Distributed BM25            Semantic retrieval
+          (2 rounds)                  (1 round)
+                  |                           |
+                  v                           v
+           Lexical ranking            Semantic ranking
+                  |                           |
+                  +-------------+-------------+
+                                |
+                                v
+                     Reciprocal Rank Fusion
+                                |
+                                v
+                         Hybrid ranking
+```
+
+`/search` and `/search/semantic` are untouched. `/search/hybrid` composes them —
+it re-implements neither fan-out.
+
+### Why not add the two scores
+
+The obvious approach is wrong:
+
+```text
+hybrid = 0.5 * bm25 + 0.5 * cosine        # not defensible
+```
+
+BM25 is unbounded, depends on corpus statistics, and moves with the query — in
+this project's own measurements the same document scored 0.3696 and then 0.4627
+for the same query after one deletion changed `df`. Cosine over unit vectors
+lives in `[-1, 1]` and occupies a much narrower band in practice. The "weight"
+would not be a weight: lexical would dominate on rare terms and vanish on
+common ones. And BM25 legitimately returns **nothing** for a paraphrase, so on
+exactly the queries semantic search exists to answer, half the weighted sum
+would contribute zero.
+
+Normalizing first does not rescue it. Min-max over the returned candidates is
+candidate-set dependent: the best candidate maps to 1.0 whether it is excellent
+or merely the least bad, and an empty list has no range at all.
+
+### Reciprocal Rank Fusion
+
+Rank, not score:
+
+```text
+RRF(d) = sum over the lists containing d of  1 / (k + rank(d))     ranks 1-based
+```
+
+A document in only one list contributes only that term — **no penalty rank**,
+because "BM25 found nothing" is a normal outcome here. A document in both
+appears once, with its contributions summed. Ordering is fusion score
+descending, then `document_id` ascending; no underlying score acts as a hidden
+tie-break.
+
+`score` is a **fusion score**. Not BM25 relevance, not a cosine, not a
+probability. Values are small (≈0.016–0.033) and mean something only relative to
+each other within one response.
+
+### Candidate depth, and what it does not guarantee
+
+Each path is asked for `min(5 × limit, 100)` candidates, so `limit=10` retrieves
+50 from each. `total` is the **candidate union size** — how many distinct
+documents entered fusion.
+
+**Hybrid results are the exact RRF of the retrieved candidate lists, not
+necessarily of the whole corpus.** This is a real limitation and unlike the
+distributed top-k arguments elsewhere in this project it cannot be argued away.
+There, local top-k provably sufficed because scores were globally comparable.
+Here truncation happens *before* fusion and RRF consumes ranks, so a document
+outside both candidate lists is absent even if its fused score would have placed
+it.
+
+### Execution and the lock
+
+Both the engine and the coordinator split each retrieval into a thin public
+wrapper and a lock-free internal, so hybrid acquires the operation lock **once**.
+This was not optional: the locks are not reentrant, so a hybrid method calling
+the two public methods would have deadlocked rather than merely serialised.
+
+Holding one lock across both retrievals is what stops a write from landing
+between them and producing a lexical ranking of one corpus state fused with a
+semantic ranking of another.
+
+Inside that lock the two behave differently, on purpose:
+
+| | Coordinator | Single node |
+| --- | --- | --- |
+| Work | two network fan-outs | in-memory CPU |
+| Execution | **concurrent** (`asyncio.gather`) | **sequential** |
+| Why | each path spends its time waiting, so they overlap | threads would add contention without shortening anything |
+
+Measured on the live 7-process cluster, concurrency saved a **median 9.3%**
+(range −1.4% to +15.4%) — real but well short of `max(lexical, semantic)`,
+because the shard nodes serialise the overlapping requests behind their own
+per-node locks. Sequential and concurrent produce identical rankings.
+
+### Failure semantics
+
+**Either retrieval path failing fails the request**, with 503. "Hybrid" asserts
+that both signals took part, so returning one of them under that name would
+misdescribe the result. A lexical result that is merely *empty* is not a
+failure — that is the ordinary outcome for a paraphrase, and fusion handles it
+as a one-sided contribution.
+
+With semantic search disabled, `/search/hybrid` returns **503** naming the
+cause, rather than silently degrading to BM25.
+
+### Explaining a result
+
+The two ranks are always present, because together they reconstruct the score
+exactly. `explain=true` adds the underlying scores:
+
+```json
+{
+  "document_id": "part-1",
+  "score": 0.03278688524590164,
+  "text": "PX-9174-Q battery replacement procedure for field engineers",
+  "lexical_rank": 1, "semantic_rank": 1,
+  "lexical_score": 12.271087451758785, "semantic_score": 0.715132474899292
+}
+```
+
+## Retrieval evaluation
+
+A small synthetic corpus written for this project: **67 documents, 32 labelled
+queries**. It supports statements about *these* queries and nothing wider.
+
+The queries are split and the split is respected. **12 development queries**
+chose the RRF constant and the candidate depth; the **20 evaluation queries**
+were then measured once with those values frozen. Tuning on the queries you
+report is how a measurement becomes an advertisement.
+
+### Parameter development (development queries — optimistic by construction)
+
+| rrf_k | depth | Recall@5 | Recall@10 | MRR |
+| --- | --- | --- | --- | --- |
+| 10 | 10 | 0.833 | 0.903 | 0.838 |
+| 30 | 10 | 0.833 | 0.861 | 0.838 |
+| 60 | 10 | 0.833 | 0.861 | 0.838 |
+| 10 / 30 / 60 | 20 | 0.833 | 0.861 | 0.833 |
+| 10 / 30 / 60 | 50 | 0.833 | 0.861 | 0.833 |
+
+The sweep is **flat**: MRR spans 0.833–0.838 across all nine settings, a
+difference of one rank position on one of twelve queries. So the measurement did
+not choose the default — it showed there was nothing to choose. `rrf_k=60` and a
+depth of `5 × limit` were kept for stability rather than to chase noise.
+
+### Held-out evaluation (20 queries, parameters frozen)
+
+| Mode | Recall@5 | Recall@10 | MRR |
+| --- | --- | --- | --- |
+| BM25 | 0.725 | 0.725 | 0.732 |
+| semantic | 0.925 | 0.933 | **1.000** |
+| hybrid | 0.858 | 0.933 | 0.865 |
+
+**Hybrid did not beat semantic alone on this set.** By category (MRR, small
+samples — direction only):
+
+| Category | n | BM25 | semantic | hybrid |
+| --- | --- | --- | --- | --- |
+| semantic | 6 | 0.19 | 1.00 | **0.55** |
+| lexical | 6 | 1.00 | 1.00 | 1.00 |
+| mixed | 4 | 1.00 | 1.00 | 1.00 |
+| distractor | 4 | 0.88 | 1.00 | **1.00** |
+
+Hybrid matched or improved on lexical, mixed and distractor queries — it
+recovered BM25's loss on `"upgrading without downtime"` — and lost ground on
+four of six paraphrases.
+
+### Why fusion lost, exactly
+
+The mechanism is worth stating because it is the honest lesson of the phase.
+Take `"searching by meaning rather than keywords"`:
+
+```text
+BM25      cook-4 (5.87)  cook-6 (5.64)  gen-4 (5.64)  ...   ir-3 absent
+semantic  ir-3 (0.435)   rfc-1 (0.221)  ir-2 (0.219)  ...
+hybrid    cook-4 0.0313 (lex 1, sem 7)  ...  ir-3 0.0164 (lex none, sem 1)
+```
+
+`cook-4` is *"season in layers **rather than** all at the end"*. It matches on
+`rather` and `than`. BM25 is not merely unhelpful here — it is **confidently
+wrong**, and RRF weighs both retrievers equally, so three wrong documents each
+contributing `1/(60+small rank)` outrank the correct document's single
+contribution.
+
+The contrast with `"making dinner"` makes it sharp: there BM25 matched **nothing
+at all**, contributed nothing, and hybrid equalled semantic exactly.
+
+> **BM25 finding nothing is harmless to fusion. BM25 finding the wrong thing is
+> what hurts.**
+
+The root cause traces to a Phase 1 decision: there is no stop-word filtering, so
+common words produce spurious lexical matches. RRF is scale-free but it is not
+quality-aware — it cannot tell a confident retriever from a correct one.
+
+Two further caveats. Semantic scored a **perfect 1.000 MRR** on this corpus,
+which leaves fusion nothing to gain and everything to lose; a corpus this small
+and this cleanly separated flatters it. And the evaluation contains no query
+where BM25 beats semantic, so it cannot show the case where fusion would help
+most.
+
+### Observed examples
+
+Live, through the coordinator on the 7-process cluster:
+
+```text
+"car maintenance"              /search          total=1   prod-1  (matches "maintenance")
+                               /search/semantic veh-1 0.601, veh-2 0.525
+                               /search/hybrid   prod-1 first  <- the failure mode above
+
+"ERR_CONN_RESET_1044"          /search          err-3 11.15, err-1 7.63, err-2 7.63
+                               /search/semantic err-3 0.793, err-2 0.763, err-1 0.760
+                               /search/hybrid   err-3 first (lex 1, sem 1)
+
+"PX-9174-Q battery failure"    /search/hybrid   part-1 first (lex 1, sem 1)
+```
 
 ## Semantic search
 
@@ -1260,7 +1492,7 @@ split-brain prevention by static roles, and a capability-aware cluster status.
 Leader election and automatic promotion were evaluated and deliberately not
 built; the reasoning is above.
 
-### Phase 5 — Semantic and vector search ✅ *current*
+### Phase 5 — Semantic and vector search ✅
 
 Embeddings behind a swappable boundary, an exact vector index, a semantic search
 API, distributed semantic retrieval with failover, and a labelled evaluation
@@ -1268,11 +1500,11 @@ against BM25. Approximate nearest-neighbour search and FAISS were both evaluated
 and deliberately declined; the reasoning and the measurements that would
 overturn it are above.
 
-### Phase 6 — Hybrid search
+### Phase 6 — Hybrid search ✅ *current*
 
-BM25 and vector candidate retrieval, score normalization, reciprocal rank fusion
-or an equivalent, configurable retrieval strategies, and measured comparison of
-BM25-only versus vector-only versus hybrid retrieval.
+Reciprocal Rank Fusion over the two existing rankings, candidate-depth control,
+explainable per-result ranks, and a held-out evaluation of all three modes by
+query category — including the queries where fusion made things worse, and why.
 
 ### Phase 7 — Production engineering
 

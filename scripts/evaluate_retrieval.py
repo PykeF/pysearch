@@ -1,148 +1,47 @@
-"""Measure lexical and semantic retrieval side by side.
+"""Compare lexical, semantic and hybrid retrieval on the project's labelled set.
 
+    uv run --extra semantic python scripts/evaluate_retrieval.py --develop
     uv run --extra semantic python scripts/evaluate_retrieval.py
 
-Two independent retrieval systems answer the same labelled queries, and the
-results are reported separately. They are deliberately **not** combined: how to
-fuse two rankings is the next phase's question, and answering it here would hide
-the thing this script exists to show — that the two fail in different places.
+``--develop`` runs the parameter experiment on the **development** queries: it
+varies the RRF constant and the candidate depth and prints what each choice
+scores. That is how the defaults in ``app/hybrid/fusion.py`` were picked.
 
-The corpus is synthetic and written for this project, so it can be committed
-without licensing questions. It is far too small to say anything about retrieval
-quality in general; the point is the measurement discipline, not the number.
+The default run evaluates all three modes on the **held-out evaluation**
+queries, with those parameters frozen. Tuning on the queries you then report is
+how a measurement turns into an advertisement, so the two are kept apart.
+
+This is a small synthetic set written for this project. It supports statements
+about *these* queries and nothing wider.
 
 Metrics
 -------
 
-Recall@k   fraction of relevant documents that appear in the top k
+Recall@k   fraction of the relevant documents that appear in the top k
 MRR        mean reciprocal rank of the first relevant document
 """
 
+import argparse
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
+from app.hybrid.fusion import FusionConfig
 from app.search.document import Document
-from app.search.engine import SearchEngine, SearchResults
+from app.search.engine import SearchEngine
 from app.semantic.embedder import Model2VecEmbedder
 from app.storage.sqlite_store import IN_MEMORY, SqliteDocumentStore
-
-CORPUS: dict[str, str] = {
-    # Vehicles, described without the words a user is likely to type.
-    "veh-1": "automobile repair and servicing for engines and gearboxes",
-    "veh-2": "how to keep a motor vehicle running smoothly through winter",
-    "veh-3": "brake pads, tyre pressure and other roadworthiness checks",
-    "veh-4": "replacing worn windscreen wipers before the rainy season",
-    # Retrieval, described in its own vocabulary.
-    "ir-1": "BM25 ranks documents using term frequency and inverse document frequency",
-    "ir-2": "an inverted index maps each term to the documents that contain it",
-    "ir-3": "vector similarity retrieves passages that mean the same thing",
-    "ir-4": "tokenization splits text into the units an index actually stores",
-    "ir-5": "stop words carry little signal but occupy most of a posting list",
-    # Distributed systems.
-    "sys-1": "sharding splits a dataset so that each node stores only part of it",
-    "sys-2": "replication keeps a second durable copy so a lost node loses nothing",
-    "sys-3": "a coordinator fans a query out to every shard and merges the answers",
-    "sys-4": "a write is acknowledged only once every copy has committed it durably",
-    "sys-5": "leader election lets a cluster agree on which node may accept writes",
-    # Cooking, as an unrelated topic.
-    "cook-1": "simmer the sauce gently while the pasta finishes cooking",
-    "cook-2": "a sharp knife and a hot pan matter more than an expensive recipe",
-    "cook-3": "let the dough rest before shaping it into loaves",
-    # Near-identical documents distinguished only by an identifier. This is the
-    # case exact matching is built for and embeddings are worst at: the
-    # surrounding text is deliberately almost the same in all three.
-    "err-1": "error code E2231 indicates a failed checksum on the write path",
-    "err-2": "error code E4410 indicates a failed checksum on the write path",
-    "err-3": "error code E7782 indicates a failed checksum on the write path",
-    # Endpoint documentation, likewise near-identical apart from the path.
-    "api-1": "the coordinator exposes /cluster/status for operators",
-    "api-2": "the coordinator exposes /index/stats for operators",
-    "api-3": "the coordinator exposes /search/semantic for operators",
-}
-
-
-@dataclass(frozen=True, slots=True)
-class LabelledQuery:
-    """A query and the documents a human would call relevant."""
-
-    query: str
-    relevant: frozenset[str]
-    note: str
-
-
-QUERIES: tuple[LabelledQuery, ...] = (
-    # Paraphrases: the query shares few or no words with the answer.
-    LabelledQuery(
-        "car maintenance",
-        frozenset({"veh-1", "veh-2", "veh-3", "veh-4"}),
-        "paraphrase: 'car' appears in no document",
-    ),
-    LabelledQuery(
-        "fixing a broken engine",
-        frozenset({"veh-1", "veh-2"}),
-        "paraphrase, partial overlap",
-    ),
-    LabelledQuery(
-        "searching by meaning rather than keywords",
-        frozenset({"ir-3"}),
-        "conceptual, little lexical overlap",
-    ),
-    LabelledQuery(
-        "surviving the loss of a machine",
-        frozenset({"sys-2"}),
-        "paraphrase of replication",
-    ),
-    LabelledQuery(
-        "splitting data across machines",
-        frozenset({"sys-1"}),
-        "paraphrase of sharding",
-    ),
-    LabelledQuery(
-        "making dinner",
-        frozenset({"cook-1", "cook-2", "cook-3"}),
-        "paraphrase of cooking",
-    ),
-    # Exact vocabulary: the query uses the document's own words.
-    LabelledQuery(
-        "how does BM25 work",
-        frozenset({"ir-1"}),
-        "exact keyword",
-    ),
-    LabelledQuery(
-        "inverted index",
-        frozenset({"ir-2"}),
-        "exact phrase",
-    ),
-    LabelledQuery(
-        "stop words posting list",
-        frozenset({"ir-5"}),
-        "exact terms",
-    ),
-    # Identifiers: one rare token decides the answer, and everything around it
-    # is near-identical, so meaning cannot separate the candidates.
-    LabelledQuery(
-        "E2231",
-        frozenset({"err-1"}),
-        "identifier among near-identical documents",
-    ),
-    LabelledQuery(
-        "E7782 checksum",
-        frozenset({"err-3"}),
-        "identifier among near-identical documents",
-    ),
-    LabelledQuery(
-        "/index/stats",
-        frozenset({"api-2"}),
-        "path among near-identical documents",
-    ),
-    LabelledQuery(
-        "/search/semantic endpoint",
-        frozenset({"api-3"}),
-        "path among near-identical documents",
-    ),
+from scripts.evaluation_data import (
+    CATEGORIES,
+    CORPUS,
+    DEVELOPMENT_QUERIES,
+    EVALUATION_QUERIES,
+    LabelledQuery,
 )
 
-K = 5
+LIMIT = 10
+RETRIEVE = 20
+
+Searcher = Callable[[str, int], list[str]]
 
 
 def recall_at_k(ranked: Sequence[str], relevant: frozenset[str], k: int) -> float:
@@ -161,78 +60,173 @@ def reciprocal_rank(ranked: Sequence[str], relevant: frozenset[str]) -> float:
 
 
 @dataclass(frozen=True, slots=True)
-class Evaluation:
-    """What one retrieval mode scored across the labelled queries."""
+class Scores:
+    """What one retrieval mode scored over a set of queries."""
 
-    recall: float
+    recall_at_5: float
+    recall_at_10: float
     mrr: float
-    ranks: list[float]
-    candidates: list[int]
+    per_query: dict[str, float]
 
 
-def evaluate(search: Callable[[str, int], SearchResults]) -> Evaluation:
-    """Score one retrieval mode over every labelled query."""
-    recalls: list[float] = []
+def evaluate(search: Searcher, queries: Sequence[LabelledQuery]) -> Scores:
+    """Score one retrieval mode over every query in a set."""
+    recall5: list[float] = []
+    recall10: list[float] = []
     ranks: list[float] = []
-    candidates: list[int] = []
-    for labelled in QUERIES:
-        outcome = search(labelled.query, 20)
-        ranked = [hit.document_id for hit in outcome.results]
-        recalls.append(recall_at_k(ranked, labelled.relevant, K))
-        ranks.append(reciprocal_rank(ranked, labelled.relevant))
-        candidates.append(outcome.total)
-    return Evaluation(
-        recall=sum(recalls) / len(recalls),
-        mrr=sum(ranks) / len(ranks),
-        ranks=ranks,
-        candidates=candidates,
+    per_query: dict[str, float] = {}
+
+    for labelled in queries:
+        ranked = search(labelled.query, RETRIEVE)
+        recall5.append(recall_at_k(ranked, labelled.relevant, 5))
+        recall10.append(recall_at_k(ranked, labelled.relevant, 10))
+        rank = reciprocal_rank(ranked, labelled.relevant)
+        ranks.append(rank)
+        per_query[labelled.query] = rank
+
+    count = len(queries)
+    return Scores(
+        recall_at_5=sum(recall5) / count,
+        recall_at_10=sum(recall10) / count,
+        mrr=sum(ranks) / count,
+        per_query=per_query,
     )
 
 
-def main() -> int:
-    print("local development measurement on a small synthetic corpus — not a benchmark")
-    print(f"{len(CORPUS)} documents, {len(QUERIES)} labelled queries, k={K}\n")
-
-    embedder = Model2VecEmbedder.load()
-    engine = SearchEngine(SqliteDocumentStore.open(IN_MEMORY), embedder=embedder)
+def build_engine() -> SearchEngine:
+    """One engine holding the whole corpus, with semantic retrieval enabled."""
+    engine = SearchEngine(SqliteDocumentStore.open(IN_MEMORY), embedder=Model2VecEmbedder.load())
     engine.initialize()
     for document_id, text in CORPUS.items():
         engine.index_document(Document(document_id=document_id, text=text))
+    return engine
 
-    def lexical(query: str, limit: int) -> SearchResults:
-        return engine.search(query, limit)
 
-    def semantic(query: str, limit: int) -> SearchResults:
-        return engine.semantic_search(engine.embed_query(query), limit)
+def searchers(engine: SearchEngine, config: FusionConfig) -> dict[str, Searcher]:
+    """The three retrieval modes, as interchangeable ranked-id functions."""
+    return {
+        "BM25": lambda query, limit: [
+            hit.document_id for hit in engine.search(query, limit).results
+        ],
+        "semantic": lambda query, limit: [
+            hit.document_id
+            for hit in engine.semantic_search(engine.embed_query(query), limit).results
+        ],
+        "hybrid": lambda query, limit: [
+            hit.document_id for hit in engine.hybrid_search(query, limit, config).results
+        ],
+    }
 
-    lexical_result = evaluate(lexical)
-    semantic_result = evaluate(semantic)
 
-    print(f"{'query':<46} {'BM25 RR':>8} {'sem RR':>7} {'BM25 hits':>10} {'sem hits':>9}")
-    print("-" * 96)
-    for position, labelled in enumerate(QUERIES):
+def develop(engine: SearchEngine) -> int:
+    """Choose the RRF constant and candidate depth on the development queries."""
+    print("PARAMETER DEVELOPMENT — development queries only")
+    print(f"{len(CORPUS)} documents, {len(DEVELOPMENT_QUERIES)} development queries\n")
+
+    baselines = searchers(engine, FusionConfig())
+    for name in ("BM25", "semantic"):
+        scores = evaluate(baselines[name], DEVELOPMENT_QUERIES)
         print(
-            f"{labelled.query!r:<46} "
-            f"{lexical_result.ranks[position]:>8.2f} "
-            f"{semantic_result.ranks[position]:>7.2f} "
-            f"{lexical_result.candidates[position]:>10} "
-            f"{semantic_result.candidates[position]:>9}   ({labelled.note})"
+            f"  {name:<9} Recall@5 {scores.recall_at_5:.3f}   "
+            f"Recall@10 {scores.recall_at_10:.3f}   MRR {scores.mrr:.3f}"
         )
-    print("-" * 96)
-    print(f"{'Recall@' + str(K):<46} {lexical_result.recall:>8.2f} {semantic_result.recall:>7.2f}")
-    print(f"{'MRR':<46} {lexical_result.mrr:>8.2f} {semantic_result.mrr:>7.2f}")
 
-    print("\nRR is the reciprocal rank of the first relevant document: 1.00 means it came")
-    print("first, 0.00 means it never appeared. 'hits' is how many documents each mode")
-    print("considered a candidate at all — and that column is the real difference. BM25")
-    print("has a notion of not matching, so it returns nothing for a paraphrase and")
-    print("exactly one document for an identifier. A similarity is defined for every")
-    print("document, so semantic search always ranks the whole corpus and never says")
-    print("'no'. The two are reported separately and never combined: how to fuse them")
-    print("is the next phase's question.")
+    print(f"\n{'rrf_k':>6} {'depth':>7} {'Recall@5':>9} {'Recall@10':>10} {'MRR':>7}")
+    print("-" * 44)
+    best: tuple[float, float, int, int] | None = None
+    for multiplier in (1, 2, 5):
+        for rrf_k in (10, 30, 60):
+            config = FusionConfig(rrf_k=rrf_k, candidate_multiplier=multiplier)
+            scores = evaluate(searchers(engine, config)["hybrid"], DEVELOPMENT_QUERIES)
+            print(
+                f"{rrf_k:>6} {config.candidate_depth(LIMIT):>7} "
+                f"{scores.recall_at_5:>9.3f} {scores.recall_at_10:>10.3f} {scores.mrr:>7.3f}"
+            )
+            candidate = (scores.mrr, scores.recall_at_5, rrf_k, multiplier)
+            if best is None or candidate[:2] > best[:2]:
+                best = candidate
 
-    engine.close()
+    if best is not None:
+        chosen = FusionConfig(rrf_k=best[2], candidate_multiplier=best[3])
+        print(
+            f"\nbest on these queries: rrf_k={best[2]}, "
+            f"candidate depth={chosen.candidate_depth(LIMIT)} "
+            f"(MRR {best[0]:.3f}, Recall@5 {best[1]:.3f})"
+        )
+    print("\nThese numbers select the defaults. They are not an evaluation result:")
+    print("they are measured on the queries that chose them, so they are optimistic.")
     return 0
+
+
+def report(engine: SearchEngine) -> int:
+    """Evaluate the three modes on the held-out queries with frozen parameters."""
+    config = FusionConfig()
+    modes = searchers(engine, config)
+    scored = {name: evaluate(search, EVALUATION_QUERIES) for name, search in modes.items()}
+
+    print("HELD-OUT EVALUATION — parameters frozen from the development queries")
+    print(f"rrf_k={config.rrf_k}, candidate depth={config.candidate_depth(LIMIT)}")
+    print(f"{len(CORPUS)} documents, {len(EVALUATION_QUERIES)} evaluation queries")
+    print("small synthetic project-owned set; not a general retrieval benchmark\n")
+
+    print(f"{'mode':<10} {'Recall@5':>9} {'Recall@10':>10} {'MRR':>7}")
+    print("-" * 40)
+    for name, scores in scored.items():
+        print(
+            f"{name:<10} {scores.recall_at_5:>9.3f} {scores.recall_at_10:>10.3f} {scores.mrr:>7.3f}"
+        )
+
+    print("\nBy category (MRR; sample sizes are small, so read these as direction only)")
+    print(f"{'category':<12} {'n':>3} {'BM25':>7} {'semantic':>9} {'hybrid':>7}")
+    print("-" * 42)
+    for category in CATEGORIES:
+        group = [query for query in EVALUATION_QUERIES if query.category == category]
+        if not group:
+            continue
+        row = [
+            sum(scored[name].per_query[query.query] for query in group) / len(group)
+            for name in ("BM25", "semantic", "hybrid")
+        ]
+        print(f"{category:<12} {len(group):>3} {row[0]:>7.2f} {row[1]:>9.2f} {row[2]:>7.2f}")
+
+    print("\nPer query (reciprocal rank of the first relevant document)")
+    print(f"{'query':<44} {'cat':<11} {'BM25':>6} {'sem':>6} {'hyb':>6}")
+    print("-" * 80)
+    losses: list[str] = []
+    for labelled in EVALUATION_QUERIES:
+        values = [scored[name].per_query[labelled.query] for name in ("BM25", "semantic", "hybrid")]
+        worse = values[2] < max(values[0], values[1]) - 1e-9
+        if worse:
+            losses.append(labelled.query)
+        print(
+            f"{labelled.query!r:<44} {labelled.category:<11} "
+            f"{values[0]:>6.2f} {values[1]:>6.2f} {values[2]:>6.2f}"
+            f"{'   <- hybrid below its best input' if worse else ''}"
+        )
+
+    print(
+        f"\nhybrid ranked below its best input on {len(losses)} of "
+        f"{len(EVALUATION_QUERIES)} queries"
+    )
+    for query in losses:
+        print(f"  - {query!r}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--develop",
+        action="store_true",
+        help="run the parameter experiment on the development queries",
+    )
+    arguments = parser.parse_args()
+
+    engine = build_engine()
+    try:
+        return develop(engine) if arguments.develop else report(engine)
+    finally:
+        engine.close()
 
 
 if __name__ == "__main__":
